@@ -1,0 +1,85 @@
+// SPDX-FileCopyrightText: 2002-2026 PCSX2 Dev Team
+// SPDX-License-Identifier: GPL-3.0+
+
+#pragma once
+
+#include <array>
+#include "common/Threading.h"
+
+namespace PerformanceMetrics
+{
+	enum class InternalFPSMethod
+	{
+		None,
+		GSPrivilegedRegister,
+		DISPFBBlit
+	};
+
+	static constexpr u32 NUM_FRAME_TIME_SAMPLES = 150;
+	using FrameTimeHistory = std::array<float, NUM_FRAME_TIME_SAMPLES>;
+
+	void Clear();
+	void Reset();
+	void Update(bool gs_register_write, bool fb_blit, bool is_skipping_present);
+	void OnGPUPresent(float gpu_time, u64 vs_invocations, u64 ps_invocations);
+
+	/// Enables per-thread CPU time sampling for non-native telemetry consumers.
+	/// Native OSD CPU metrics always override this gate while visible.
+	void SetCPUThreadUsageEnabled(bool enabled);
+
+	/// Enables min/average/max frame-time sampling for non-native telemetry consumers.
+	/// Native OSD GS/frame-time views always override this gate while visible.
+	void SetFrameTimeStatsEnabled(bool enabled);
+
+	/// Enables frame history sampling for non-native telemetry consumers.
+	/// Native OSD frame-time graphs always override this gate while visible.
+	void SetFrameTimeHistoryEnabled(bool enabled);
+
+	/// Sets the EE thread for CPU usage calculations.
+	void SetGSBackThread(Threading::ThreadHandle thread);
+	bool HasGSBackThread();
+	float GetGSBackThreadUsage();
+	float GetGSBackThreadAverageTime();
+	void SetCPUThread(Threading::ThreadHandle thread);
+	/// Sets the IOP worker handle on the CPU thread; clear it before joining/stopping the worker.
+	void SetIOPThread(Threading::ThreadHandle thread);
+
+	/// Sets timers for GS software threads.
+	void SetGSSWThreadCount(u32 count);
+	void SetGSSWThread(u32 index, Threading::ThreadHandle thread);
+
+	u64 GetFrameNumber();
+
+	InternalFPSMethod GetInternalFPSMethod();
+	bool IsInternalFPSValid();
+
+	float GetFPS();
+	float GetInternalFPS();
+	float GetSpeed();
+	float GetAverageFrameTime();
+	float GetMinimumFrameTime();
+	float GetMaximumFrameTime();
+
+	double GetCPUThreadUsage();
+	double GetCPUThreadAverageTime();
+	/// Returns a consistent usage/time snapshot when an IOP worker handle is installed.
+	bool GetIOPThreadMetrics(float& usage, float& average_time);
+	float GetGSThreadUsage();
+	float GetGSThreadAverageTime();
+	float GetVUThreadUsage();
+	float GetVUThreadAverageTime();
+	float GetCaptureThreadUsage();
+	float GetCaptureThreadAverageTime();
+
+	u32 GetGSSWThreadCount();
+	double GetGSSWThreadUsage(u32 index);
+	double GetGSSWThreadAverageTime(u32 index);
+
+	float GetGPUUsage();
+	float GetGPUAverageTime();
+	double GetGPUAverageVSInvocations();
+	double GetGPUAveragePSInvocations();
+
+	const FrameTimeHistory& GetFrameTimeHistory();
+	u32 GetFrameTimeHistoryPos();
+} // namespace PerformanceMetrics

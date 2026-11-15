@@ -1,0 +1,162 @@
+#pragma once
+
+#include <jni.h>
+
+#include "emucorex/tfx_preparation_job.h"
+
+#include <condition_variable>
+#include <future>
+#include <memory>
+#include <mutex>
+#include <string>
+#include <thread>
+#include <unordered_map>
+
+namespace emucorex::android
+{
+struct RuntimePaths
+{
+	std::string data_root;
+	std::string native_library_dir;
+};
+
+using RuntimeSettings = std::unordered_map<std::string, std::string>;
+
+struct VmLaunchConfig
+{
+	RuntimePaths paths;
+	RuntimeSettings settings;
+	std::string path;
+	bool boot_elf = false;
+	bool boot_irx = false;
+	int probe_steps = 0;
+};
+
+class AndroidRuntime
+{
+public:
+	static AndroidRuntime& Instance();
+
+	void Initialize(std::string data_root, int api_version);
+	void ReloadDataRoot(std::string data_root);
+	void SetNativeLibraryDir(std::string path);
+	void BeginSettingsBatch();
+	void EndSettingsBatch();
+	void SetSetting(std::string section, std::string key, std::string type, std::string value);
+	std::string GetSetting(const std::string& section, const std::string& key) const;
+	void SetFrameLimitEnabled(bool enabled);
+	void SetTurboModeEnabled(bool enabled);
+	void ReloadPatches();
+	void SetNativeSurface(void* window, int width, int height, float refresh_rate, uint64_t generation);
+	void ClearSurface(uint64_t generation = 0);
+	bool GetNativeSurface(void** window, int* width, int* height, float* refresh_rate) const;
+
+	bool StartVm(std::string path, bool boot_elf, int probe_steps, bool boot_irx = false);
+	bool CheckTFXPreparationReadiness();
+	bool StartTFXPreparation();
+	bool CancelTFXPreparation(uint64_t job_id);
+	bool ResumeTFXPreparation(uint64_t job_id);
+	TFXPreparationStatus GetTFXPreparationStatus() const;
+#if defined(EMUCOREX_ENABLE_NATIVE_SELF_TESTS)
+	int RunTFXPreparationRuntimeTests();
+#endif
+	bool ChangeDisc(std::string path);
+	void Pause();
+	void Resume();
+	void Shutdown();
+	bool HasValidVm() const;
+
+	std::string GetGameTitle(const std::string& path) const;
+	std::string GetGameSerial() const;
+	std::string GetSaveStatePathForFile(const std::string& path, int slot) const;
+	bool SaveStateToSlot(int slot);
+	uint64_t BeginSaveStateToSlot(int slot);
+	bool AwaitSaveStateSave(uint64_t ticket);
+	bool LoadStateFromSlot(int slot);
+	void WaitForSaveStateFlush();
+	std::string ListMemoryCards() const;
+	bool CreateMemoryCard(const std::string& name, int type, int file_type);
+
+	void SetPadButton(int pad_index, int index, int range, bool pressed);
+	void SetPadButtonFromSource(int pad_index, int index, int range, bool pressed, int source);
+	void SetPadPressureModifierAmount(int amount_percent);
+	void ResetPadState(int pad_index);
+	void ResetPadStateFromSource(int pad_index, int source);
+	void ResetKeyStatus();
+	void OnHostKeyEvent(int key_code, bool pressed);
+	void OnHostMousePosition(float x, float y);
+	void OnHostMouseButton(int button, bool pressed);
+	void OnHostMouseWheel(float horizontal, float vertical);
+	void Log(const std::string& message) const;
+
+private:
+	enum class VmStartupState
+	{
+		Idle,
+		Pending,
+		Succeeded,
+		Failed
+	};
+
+	AndroidRuntime() = default;
+	~AndroidRuntime();
+
+	bool IsTFXPreparationActiveLocked() const;
+	void ApplyDeferredRuntimeGlobalsLocked();
+	VmLaunchConfig CreateLaunchConfigLocked(std::string path, bool boot_elf, int probe_steps, bool boot_irx) const;
+	void VmThreadMain(VmLaunchConfig config);
+	void TFXPreparationThreadMain(VmLaunchConfig config, std::shared_ptr<TFXPreparationJob> job);
+	void NotifyVmStartup(bool succeeded);
+	void ApplyPauseStateOnCPUThread();
+	static void NotifyVmStartupThunk(void* userdata, bool succeeded);
+
+	// Completion records survive VM shutdown until their owning caller consumes them.
+	std::mutex save_state_tickets_mutex_;
+	std::unordered_map<uint64_t, std::shared_future<bool>> save_state_tickets_;
+	uint64_t next_save_state_ticket_ = 0;
+	mutable std::mutex mutex_;
+	std::condition_variable startup_cv_;
+	RuntimePaths paths_;
+	bool initialized_ = false;
+	bool settings_batch_ = false;
+	bool vm_active_ = false;
+	bool paused_ = false;
+	bool surface_suspended_ = false;
+	uint64_t surface_generation_ = 0;
+	VmStartupState startup_state_ = VmStartupState::Idle;
+	int api_version_ = 0;
+	void* native_window_ = nullptr;
+	int surface_width_ = 0;
+	int surface_height_ = 0;
+	float surface_refresh_rate_ = 0.0f;
+	std::string current_path_;
+	RuntimeSettings settings_;
+	std::thread vm_thread_;
+	bool tfx_readiness_probe_active_ = false;
+	std::shared_ptr<TFXPreparationJob> tfx_preparation_job_;
+	std::thread tfx_preparation_thread_;
+	VmLaunchConfig tfx_preparation_config_;
+	uint64_t next_tfx_preparation_job_id_ = 0;
+	bool deferred_settings_layer_init_ = false;
+	bool deferred_data_root_apply_ = false;
+	bool deferred_native_library_environment_ = false;
+	bool deferred_custom_driver_environment_ = false;
+	bool deferred_app_version_environment_ = false;
+};
+
+std::string JStringToString(JNIEnv* env, jstring value);
+jstring StringToJString(JNIEnv* env, const std::string& value);
+void ConfigureNativeAppCallbacks(JNIEnv* env, jclass native_app_class);
+JavaVM* GetJavaVM();
+void DispatchPadVibration(int pad_index, float large_motor, float small_motor);
+void DispatchRetroAchievementsNotification(const char* kind, const char* title, const char* message, const char* image_path);
+bool DispatchRetroAchievementsSound(const char* path);
+void SetPerformanceMetricsCallbackEnabled(bool enabled, bool detailed, bool gpu_timing);
+bool IsPerformanceGpuTimingRequested();
+void SetPerformanceGpuState(std::string name, bool timing_active);
+std::string GetPerformanceMetricsSnapshot();
+std::string GetGameplayProfilingSample();
+void RequestCurrentVmStop();
+void ClearPendingHostCpuTasks();
+void PollPendingPadUpdatesOnCPUThread();
+}

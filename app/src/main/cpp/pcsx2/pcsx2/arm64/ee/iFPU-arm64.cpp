@@ -1,0 +1,1618 @@
+// SPDX-FileCopyrightText: 2002-2025 PCSX2 Dev Team
+// SPDX-License-Identifier: GPL-3.0+
+
+#include "Common.h"
+#include "R5900OpcodeTables.h"
+#include "arm64/OaknutHelpers-arm64.h"
+#include "arm64/ee/iR5900-arm64.h"
+#include "iFPU-arm64.h"
+
+#if !defined(__ANDROID__)
+using namespace x86Emitter;
+#endif
+
+//alignas(16) const u32 g_minvals[4] = {0xff7fffff, 0xff7fffff, 0xff7fffff, 0xff7fffff};
+//alignas(16) const u32 g_maxvals[4] = {0x7f7fffff, 0x7f7fffff, 0x7f7fffff, 0x7f7fffff};
+
+//------------------------------------------------------------------
+namespace R5900 {
+namespace Dynarec {
+namespace OpcodeImpl {
+namespace COP1 {
+
+namespace DOUBLE
+{
+
+	void recABS_S_xmm(int info);
+	void recADD_S_xmm(int info);
+	void recADDA_S_xmm(int info);
+	void recC_EQ_xmm(int info);
+	void recC_LE_xmm(int info);
+	void recC_LT_xmm(int info);
+	void recDIV_S_xmm(int info);
+	void recMADD_S_xmm(int info);
+	void recMADDA_S_xmm(int info);
+	void recMAX_S_xmm(int info);
+	void recMIN_S_xmm(int info);
+	void recMOV_S_xmm(int info);
+	void recMSUB_S_xmm(int info);
+	void recMSUBA_S_xmm(int info);
+	void recMUL_S_xmm(int info);
+	void recMULA_S_xmm(int info);
+	void recNEG_S_xmm(int info);
+	void recSUB_S_xmm(int info);
+	void recSUBA_S_xmm(int info);
+	void recSQRT_S_xmm(int info);
+	void recRSQRT_S_xmm(int info);
+
+}; // namespace DOUBLE
+
+//------------------------------------------------------------------
+// Helper Macros
+//------------------------------------------------------------------
+#define _Ft_ _Rt_
+#define _Fs_ _Rd_
+#define _Fd_ _Sa_
+
+// FCR31 Flags
+#define FPUflagC  0x00800000
+#define FPUflagI  0x00020000
+#define FPUflagD  0x00010000
+#define FPUflagO  0x00008000
+#define FPUflagU  0x00004000
+#define FPUflagSI 0x00000040
+#define FPUflagSD 0x00000020
+#define FPUflagSO 0x00000010
+#define FPUflagSU 0x00000008
+
+// Add/Sub opcodes produce the same results as the ps2
+#define FPU_CORRECT_ADD_SUB (CHECK_FPU_OVERFLOW && CHECK_FPU_CORRECT_ADD_SUB)
+
+//alignas(16) static const u32 s_neg[4] = {0x80000000, 0xffffffff, 0xffffffff, 0xffffffff};
+//alignas(16) static const u32 s_pos[4] = {0x7fffffff, 0xffffffff, 0xffffffff, 0xffffffff};
+
+//------------------------------------------------------------------
+
+//------------------------------------------------------------------
+// *FPU Opcodes!*
+//------------------------------------------------------------------
+
+// Those opcode are marked as special ! But I don't understand why we can't run them in the interpreter
+
+//------------------------------------------------------------------
+// CFC1 / CTC1
+//------------------------------------------------------------------
+static void recMoveGPRtoOakWForCOP1(oak::WReg to, int fromgpr)
+{
+	if (fromgpr == 0)
+	{
+		oakAsm->MOV(to, 0);
+		return;
+	}
+
+	if (GPR_IS_CONST1(fromgpr))
+	{
+		oakAsm->MOV(to, g_cpuConstRegs[fromgpr].UL[0]);
+		return;
+	}
+
+	const int gprreg = _checkX86reg(X86TYPE_GPR, fromgpr, MODE_READ);
+	if (gprreg >= 0)
+	{
+		oakAsm->MOV(to, oakWRegister(gprreg));
+		return;
+	}
+
+	const int xmmreg = _checkXMMreg(XMMTYPE_GPRREG, fromgpr, MODE_READ);
+	if (xmmreg >= 0)
+	{
+		oakAsm->FMOV(to, oakSRegister(xmmreg));
+		return;
+	}
+
+	oakLoad32(to, {oak::util::X27, static_cast<s64>(offsetof(cpuRegistersPack, cpuRegs.GPR.r[fromgpr].UL[0]))});
+}
+
+static void recCFC1_emit_oaknut()
+{
+	if (!_Rt_)
+		return;
+	EE::Profiler.EmitOp(eeOpcode::CFC1);
+
+	const int regt = _allocX86reg(X86TYPE_GPR, _Rt_, MODE_WRITE);
+	recBeginOaknutEmit();
+
+	const oak::WReg regt_w = oakWRegister(regt);
+	if (_Fs_ >= 16)
+	{
+		// x86 recCFC1: mask off the always-zero bits, set the always-one bits.
+		oakLoad32(regt_w, {oak::util::X27, static_cast<s64>(offsetof(cpuRegistersPack, fpuRegs.fprc[31]))});
+		oakAsm->MOV(OAK_WSCRATCH, 0x0083c078u);
+		oakAsm->AND(regt_w, regt_w, OAK_WSCRATCH);
+		oakAsm->MOV(OAK_WSCRATCH, 0x01000001u);
+		oakAsm->ORR(regt_w, regt_w, OAK_WSCRATCH);
+	}
+	else
+	{
+		oakLoad32(regt_w, {oak::util::X27, static_cast<s64>(offsetof(cpuRegistersPack, fpuRegs.fprc[0]))});
+	}
+	oakAsm->SXTW(oakXRegister(regt), regt_w);
+
+	recEndOaknutEmit();
+}
+
+void recCFC1(void)
+{
+	recCFC1_emit_oaknut();
+}
+
+static void recCTC1_emit_oaknut()
+{
+	if (_Fs_ != 31)
+		return;
+	EE::Profiler.EmitOp(eeOpcode::CTC1);
+
+	recBeginOaknutEmit();
+	recMoveGPRtoOakWForCOP1(OAK_WSCRATCH2, _Rt_);
+	oakStore32(OAK_WSCRATCH2, {oak::util::X27, static_cast<s64>(offsetof(cpuRegistersPack, fpuRegs.fprc[31]))});
+	recEndOaknutEmit();
+}
+
+void recCTC1()
+{
+	recCTC1_emit_oaknut();
+}
+//------------------------------------------------------------------
+
+
+//------------------------------------------------------------------
+// MFC1
+//------------------------------------------------------------------
+static void recMFC1_emit_oaknut()
+{
+	if (!_Rt_)
+		return;
+
+	EE::Profiler.EmitOp(eeOpcode::MFC1);
+
+	const int xmmregt = _allocIfUsedGPRtoXmmReg(_Rt_, MODE_READ | MODE_WRITE);
+	const int regs = _allocIfUsedFPUtoXmmReg(_Fs_, MODE_READ);
+	if (regs >= 0 && xmmregt >= 0)
+	{
+		pxAssert(!GPR_IS_CONST1(_Rt_));
+
+		const int temp = _allocTempXMMreg(XMMT_FPS);
+		recBeginOaknutEmit();
+		const oak::QReg temp_q = oakQRegister(temp);
+		oakAsm->ORR(temp_q.B16(), oakQRegister(regs).B16(), oakQRegister(regs).B16());
+		oakAsm->SSHR(temp_q.S4(), temp_q.S4(), 31);
+		oakAsm->MOV(oakQRegister(xmmregt).Selem()[0], oakQRegister(regs).Selem()[0]);
+		oakAsm->MOV(oakQRegister(xmmregt).Selem()[1], temp_q.Selem()[0]);
+		recEndOaknutEmit();
+		_freeXMMreg(temp);
+		return;
+	}
+
+	const int regt = _allocX86reg(X86TYPE_GPR, _Rt_, MODE_WRITE);
+	pxAssert(!GPR_IS_CONST1(_Rt_));
+
+	recBeginOaknutEmit();
+	if (regs >= 0)
+	{
+		oakAsm->FMOV(oakWRegister(regt), oakSRegister(regs));
+	}
+	else
+	{
+		oakLoad32(oakWRegister(regt), {oak::util::X27, static_cast<s64>(offsetof(cpuRegistersPack, fpuRegs.fpr[_Fs_].UL))});
+	}
+	oakAsm->SXTW(oakXRegister(regt), oakWRegister(regt));
+	recEndOaknutEmit();
+}
+
+void recMFC1()
+{
+	recMFC1_emit_oaknut();
+}
+
+//------------------------------------------------------------------
+
+
+//------------------------------------------------------------------
+// MTC1
+//------------------------------------------------------------------
+static void recMTC1_emit_oaknut()
+{
+	EE::Profiler.EmitOp(eeOpcode::MTC1);
+	if (GPR_IS_CONST1(_Rt_))
+	{
+		const int xmmreg = _allocIfUsedFPUtoXmmReg(_Fs_, MODE_WRITE);
+		if (xmmreg >= 0)
+		{
+			const int x86reg = (g_cpuConstRegs[_Rt_].UL[0] == 0) ? -1 : _allocX86reg(X86TYPE_GPR, _Rt_, MODE_READ);
+			recBeginOaknutEmit();
+			if (g_cpuConstRegs[_Rt_].UL[0] == 0)
+			{
+				oakAsm->EOR(oakQRegister(xmmreg).B16(), oakQRegister(xmmreg).B16(), oakQRegister(xmmreg).B16());
+			}
+			else
+			{
+				oakAsm->FMOV(oakSRegister(xmmreg), oakWRegister(x86reg));
+			}
+			recEndOaknutEmit();
+		}
+		else
+		{
+			pxAssert(!_hasXMMreg(XMMTYPE_FPREG, _Fs_));
+			recBeginOaknutEmit();
+			oakAsm->MOV(OAK_WSCRATCH2, g_cpuConstRegs[_Rt_].UL[0]);
+			oakStore32(OAK_WSCRATCH2, {oak::util::X27, static_cast<s64>(offsetof(cpuRegistersPack, fpuRegs.fpr[_Fs_].UL))});
+			recEndOaknutEmit();
+		}
+	}
+	else
+	{
+		const int xmmgpr = _checkXMMreg(XMMTYPE_GPRREG, _Rt_, MODE_READ);
+		if (xmmgpr >= 0)
+		{
+			if (g_pCurInstInfo->regs[_Rt_] & EEINST_LASTUSE)
+			{
+				_deleteFPtoXMMreg(_Fs_, DELETE_REG_FREE_NO_WRITEBACK);
+				_reallocateXMMreg(xmmgpr, XMMTYPE_FPREG, _Fs_, MODE_WRITE);
+			}
+			else
+			{
+				const int xmmreg2 = _allocIfUsedFPUtoXmmReg(_Fs_, MODE_WRITE);
+				recBeginOaknutEmit();
+				if (xmmreg2 >= 0)
+				{
+					oakAsm->MOV(oakQRegister(xmmreg2).Selem()[0], oakQRegister(xmmgpr).Selem()[0]);
+				}
+				else
+				{
+					oakAsm->FMOV(OAK_WSCRATCH2, oakSRegister(xmmgpr));
+					oakStore32(OAK_WSCRATCH2, {oak::util::X27, static_cast<s64>(offsetof(cpuRegistersPack, fpuRegs.fpr[_Fs_].UL))});
+				}
+				recEndOaknutEmit();
+			}
+		}
+		else
+		{
+			const int regt = _allocX86reg(X86TYPE_GPR, _Rt_, MODE_READ);
+			const int xmmreg2 = _allocIfUsedFPUtoXmmReg(_Fs_, MODE_WRITE);
+
+			recBeginOaknutEmit();
+			if (xmmreg2 >= 0)
+			{
+				oakAsm->FMOV(oakSRegister(xmmreg2), oakWRegister(regt));
+			}
+			else
+			{
+				oakStore32(oakWRegister(regt), {oak::util::X27, static_cast<s64>(offsetof(cpuRegistersPack, fpuRegs.fpr[_Fs_].UL))});
+			}
+			recEndOaknutEmit();
+		}
+	}
+}
+
+void recMTC1()
+{
+	recMTC1_emit_oaknut();
+}
+//------------------------------------------------------------------
+
+
+//------------------------------------------------------------------
+// ABS XMM
+//------------------------------------------------------------------
+static void recABS_S_emit_oaknut(int info)
+{
+	EE::Profiler.EmitOp(eeOpcode::ABS_F);
+
+	// x86 recABS_S_xmm: the sign is cleared, FCR31 is left alone, and under
+	// CHECK_FPU_OVERFLOW the (positive) result is MINSS'd with +max (Inf/NaN -> +max).
+	recBeginOaknutEmit();
+	if (info & PROCESS_EE_S)
+		oakAsm->FMOV(OAK_WSCRATCH, oakSRegister(EEREC_S));
+	else
+		oakLoad32(OAK_WSCRATCH, {oak::util::X27, static_cast<s64>(offsetof(cpuRegistersPack, fpuRegs.fpr[_Fs_].UL))});
+	oakAsm->AND(OAK_WSCRATCH, OAK_WSCRATCH, 0x7fffffffu);
+	if (CHECK_FPU_OVERFLOW)
+	{
+		oakAsm->MOV(OAK_WSCRATCH2, 0x7f7fffffu);
+		oakAsm->CMP(OAK_WSCRATCH, OAK_WSCRATCH2);
+		oakAsm->CSEL(OAK_WSCRATCH, OAK_WSCRATCH, OAK_WSCRATCH2, oak::Cond::LS);
+	}
+	oakAsm->FMOV(oakSRegister(EEREC_D), OAK_WSCRATCH);
+	recEndOaknutEmit();
+}
+
+void recABS_S_xmm(int info)
+{
+	recABS_S_emit_oaknut(info);
+}
+
+FPURECOMPILE_CONSTCODE(ABS_S, XMMINFO_WRITED | XMMINFO_READS);
+//------------------------------------------------------------------
+
+
+static void recFpuLoadScalarOperand_emit_oaknut(int dst, int fpu_reg, int cached_reg, bool cached)
+{
+	if (cached)
+	{
+		oakAsm->MOV(oakQRegister(dst).Selem()[0], oakQRegister(cached_reg).Selem()[0]);
+	}
+	else
+	{
+		oakLoad32(OAK_WSCRATCH2, {oak::util::X27, static_cast<s64>(offsetof(cpuRegistersPack, fpuRegs.fpr[fpu_reg].UL))});
+		oakAsm->FMOV(oakSRegister(dst), OAK_WSCRATCH2);
+	}
+}
+
+static void recFpuFlushCachedOperandToMemory(int fpu_reg)
+{
+	for (u32 i = 0; i < iREGCNT_XMM; i++)
+	{
+		if (xmmregs[i].inuse && xmmregs[i].type == XMMTYPE_FPREG && xmmregs[i].reg == fpu_reg && (xmmregs[i].mode & MODE_WRITE))
+			_writebackXMMreg(i);
+	}
+}
+
+static void recFpuLoadScalarMemoryOperand_emit_oaknut(int dst, int fpu_reg)
+{
+	oakLoad32(OAK_WSCRATCH2, {oak::util::X27, static_cast<s64>(offsetof(cpuRegistersPack, fpuRegs.fpr[fpu_reg].UL))});
+	oakAsm->FMOV(oakSRegister(dst), OAK_WSCRATCH2);
+}
+
+// x86 fpuFloat (ClampValues): MINSS(max) then MAXSS(-max), so any NaN -> +max and
+// +-Inf -> +-max. FMINNM maps a quiet NaN to the number but turns a signaling NaN
+// into a NaN, so it runs twice (first quiets, second maps to +max), same as the
+// VU mVUClamp1 fast path. Gated on CHECK_FPU_OVERFLOW like the x86 helper.
+static void recFpuClampFloat3Operand_emit_oaknut(int reg)
+{
+	if (!CHECK_FPU_OVERFLOW)
+		return;
+
+	oakAsm->FMINNM(oakSRegister(reg), oakSRegister(reg), oak::SReg(8));
+	oakAsm->FMINNM(oakSRegister(reg), oakSRegister(reg), oak::SReg(8));
+	oakAsm->FMAXNM(oakSRegister(reg), oakSRegister(reg), oak::SReg(9));
+}
+
+// x86 fpuFloat3 body (PMINSD maxvals, PMINUD minvals): ungated, sign-preserving,
+// +-Inf/NaN -> +-max by sign bit.
+static void recFpuClampSign_emit_oaknut(int reg)
+{
+	oakAsm->SMIN(oakQRegister(reg).S4(), oakQRegister(reg).S4(), oakQRegister(8).S4());
+	oakAsm->UMIN(oakQRegister(reg).S4(), oakQRegister(reg).S4(), oakQRegister(9).S4());
+}
+
+// Sign-preserving operand clamp, the x86 fpuFloat2 equivalent. It is gated on
+// Extra (GameDB clampMode >= 2) exactly like the x86 fast path: exponent-255
+// operands must reach the op raw in modes 0 and 1 so an infinity/NaN input can
+// produce the IEEE result x86 produces (Inf*0 -> NaN -> result clamp), instead
+// of being folded to +/-max before the op.
+static void recFpuDoubleClampOperand_emit_oaknut(int reg)
+{
+	if (!CHECK_FPU_EXTRA_OVERFLOW)
+		return;
+
+	oakAsm->SMIN(oakQRegister(reg).S4(), oakQRegister(reg).S4(), oakQRegister(8).S4());
+	oakAsm->UMIN(oakQRegister(reg).S4(), oakQRegister(reg).S4(), oakQRegister(9).S4());
+}
+
+static void recFpuClearFcr31_emit_oaknut(u32 bits)
+{
+	oakLoad32(OAK_WSCRATCH2, {oak::util::X27, static_cast<s64>(offsetof(cpuRegistersPack, fpuRegs.fprc[31]))});
+	oakAsm->MOV(OAK_WSCRATCH, ~bits);
+	oakAsm->AND(OAK_WSCRATCH2, OAK_WSCRATCH2, OAK_WSCRATCH);
+	oakStore32(OAK_WSCRATCH2, {oak::util::X27, static_cast<s64>(offsetof(cpuRegistersPack, fpuRegs.fprc[31]))});
+}
+
+// EE FPU add/sub guard-bit emulation (ported from ARMSX2 fpuEmitGuardedAddSub, GPL-3).
+// The EE adder has no guard bits: with d = expA - expB (raw 8-bit fields), the smaller
+// operand loses its low (|d|-1) bits (d >= 25: everything but its sign). |d| <= 1 masks
+// nothing. This masks the two operands IN PLACE; the caller emits the plain FADD/FSUB
+// afterwards under the EE FPCR. sreg/treg must be allocator temps the caller owns.
+//
+// GPR scratch contract: touches only w0/w1/w2 (x86reg <= 2, never allocatable) and
+// w16 (OAK_WSCRATCH) / w17 (OAK_WSCRATCH2). On Android the int allocator hands out
+// x3,x5-x15 and x20-x23, so w9/w10 are NOT safe here: a resident FCR31 or any cached
+// GPR may live there (ARMSX2 hit this as the Shadow of the Colossus bug). No NEON
+// temp is needed since the operand temps are masked directly. Hot path (|d| <= 1)
+// falls through the 8-instruction check and skips the mask block.
+static void recFpuGuardMask_emit_oaknut(int sreg, int treg)
+{
+	if (!CHECK_FPU_GUARDED)
+		return;
+
+	oak::Label plain;
+
+	oakAsm->FMOV(OAK_WARG1, oakSRegister(sreg));
+	oakAsm->FMOV(OAK_WARG2, oakSRegister(treg));
+	oakAsm->UBFX(OAK_WARG3, OAK_WARG1, 23, 8);
+	oakAsm->UBFX(OAK_WSCRATCH, OAK_WARG2, 23, 8);
+	oakAsm->SUB(OAK_WARG3, OAK_WARG3, OAK_WSCRATCH);     // d = expS - expT
+	oakAsm->ADD(OAK_WSCRATCH, OAK_WARG3, 1);
+	oakAsm->CMP(OAK_WSCRATCH, 2);
+	oakAsm->B(oak::Cond::LS, plain);                     // -1 <= d <= 1: no masking
+
+	oakAsm->ASR(OAK_WSCRATCH2, OAK_WARG3, 31);           // all ones when d < 0
+	oakAsm->EOR(OAK_WARG3, OAK_WARG3, OAK_WSCRATCH2);
+	oakAsm->SUB(OAK_WARG3, OAK_WARG3, OAK_WSCRATCH2);    // |d|
+	oakAsm->CMP(OAK_WARG3, 25);
+	oakAsm->SUB(OAK_WARG3, OAK_WARG3, 1);                // shift = |d| - 1
+	oakAsm->MOV(OAK_WSCRATCH, 31);
+	oakAsm->CSEL(OAK_WARG3, OAK_WSCRATCH, OAK_WARG3, oak::Cond::GE); // |d| >= 25: keep sign only
+	oakAsm->MOV(OAK_WSCRATCH, -1);
+	oakAsm->LSL(OAK_WSCRATCH, OAK_WSCRATCH, OAK_WARG3);  // m = 0xffffffff << shift
+	oakAsm->ORR(OAK_WARG3, OAK_WSCRATCH, OAK_WSCRATCH2); // mask for T (all ones when d < 0)
+	oakAsm->ORN(OAK_WSCRATCH, OAK_WSCRATCH, OAK_WSCRATCH2); // mask for S (all ones when d > 0)
+	oakAsm->AND(OAK_WARG2, OAK_WARG2, OAK_WARG3);
+	oakAsm->AND(OAK_WARG1, OAK_WARG1, OAK_WSCRATCH);
+	oakAsm->FMOV(oakSRegister(treg), OAK_WARG2);
+	oakAsm->FMOV(oakSRegister(sreg), OAK_WARG1);
+
+	oakAsm->l(plain);
+}
+
+static void recADD_S_emit_oaknut(int info)
+{
+	EE::Profiler.EmitOp(eeOpcode::ADD_F);
+
+	const int sreg = _allocTempXMMreg(XMMT_FPS);
+	const int treg = _allocTempXMMreg(XMMT_FPS);
+
+	recFpuFlushCachedOperandToMemory(_Fs_);
+	if (_Ft_ != _Fs_)
+		recFpuFlushCachedOperandToMemory(_Ft_);
+
+	recBeginOaknutEmit();
+	recFpuLoadScalarMemoryOperand_emit_oaknut(sreg, _Fs_);
+	recFpuLoadScalarMemoryOperand_emit_oaknut(treg, _Ft_);
+	recFpuDoubleClampOperand_emit_oaknut(sreg);
+	recFpuDoubleClampOperand_emit_oaknut(treg);
+	recFpuGuardMask_emit_oaknut(sreg, treg);
+	oakAsm->FADD(oakSRegister(EEREC_D), oakSRegister(sreg), oakSRegister(treg));
+	recFpuClampFloat3Operand_emit_oaknut(EEREC_D);
+	recEndOaknutEmit();
+
+	_freeXMMreg(treg);
+	_freeXMMreg(sreg);
+}
+
+//------------------------------------------------------------------
+// ADD XMM
+//------------------------------------------------------------------
+void recADD_S_xmm(int info)
+{
+	recADD_S_emit_oaknut(info);
+}
+
+FPURECOMPILE_CONSTCODE(ADD_S, XMMINFO_WRITED | XMMINFO_READD | XMMINFO_READS | XMMINFO_READT);
+
+static void recADDA_S_emit_oaknut(int info)
+{
+	EE::Profiler.EmitOp(eeOpcode::ADDA_F);
+
+	const int sreg = _allocTempXMMreg(XMMT_FPS);
+	const int treg = _allocTempXMMreg(XMMT_FPS);
+
+	recBeginOaknutEmit();
+	recFpuLoadScalarOperand_emit_oaknut(sreg, _Fs_, EEREC_S, info & PROCESS_EE_S);
+	recFpuLoadScalarOperand_emit_oaknut(treg, _Ft_, EEREC_T, info & PROCESS_EE_T);
+	recFpuDoubleClampOperand_emit_oaknut(sreg);
+	recFpuDoubleClampOperand_emit_oaknut(treg);
+	recFpuGuardMask_emit_oaknut(sreg, treg);
+	oakAsm->FADD(oakSRegister(EEREC_ACC), oakSRegister(sreg), oakSRegister(treg));
+	recFpuClampFloat3Operand_emit_oaknut(EEREC_ACC);
+	recEndOaknutEmit();
+
+	_freeXMMreg(treg);
+	_freeXMMreg(sreg);
+}
+
+void recADDA_S_xmm(int info)
+{
+	recADDA_S_emit_oaknut(info);
+}
+
+FPURECOMPILE_CONSTCODE(ADDA_S, XMMINFO_WRITEACC | XMMINFO_READS | XMMINFO_READT);
+//------------------------------------------------------------------
+
+//------------------------------------------------------------------
+// BC1x XMM
+//------------------------------------------------------------------
+
+static void recBC1BranchTest_emit_oaknut()
+{
+	// Do not remove this as a simple performance cleanup. On ARM64 this currently
+	// acts as a required EE state barrier; removing it caused startup black screens.
+	_eeFlushAllDirty();
+
+	// COP1 branch conditionals are based on the following equation:
+	// (fpuRegs.fprc[31] & 0x00800000)
+	// BC2F checks if the statement is false, BC2T checks if the statement is true.
+
+	recBeginOaknutEmit();
+	oakLoad32(OAK_WSCRATCH, {oak::util::X27, static_cast<s64>(offsetof(cpuRegistersPack, fpuRegs.fprc[31]))});
+	oakAsm->TST(OAK_WSCRATCH, FPUflagC);
+	recEndOaknutEmit();
+}
+
+static bool recBC1IsBranch(u32 code, u32 rt)
+{
+	return ((code >> 26) == 0x11) && (((code >> 21) & 0x1f) == 8) && (((code >> 16) & 0x1f) == rt);
+}
+
+static u32 recBC1BranchTarget(u32 code, u32 branch_pc)
+{
+	return branch_pc + 4 + (static_cast<s32>(static_cast<s16>(code & 0xffff)) * 4);
+}
+
+static bool recBC1TDelayChainTarget(u32* branch_to)
+{
+	constexpr int SCAN_LIMIT = 8;
+	u32 scan_pc = pc;
+	u32 candidate_branch_to = *branch_to;
+	bool found = false;
+
+	for (int depth = 0; depth < SCAN_LIMIT; depth++)
+	{
+		const u32 code = *reinterpret_cast<u32*>(PSM(scan_pc));
+		if (!recBC1IsBranch(code, 1))
+			break;
+
+		candidate_branch_to = recBC1BranchTarget(code, scan_pc);
+		scan_pc += 4;
+		found = true;
+	}
+
+	if (recBC1IsBranch(*reinterpret_cast<u32*>(PSM(scan_pc)), 1))
+		return false;
+
+	if (found)
+		*branch_to = candidate_branch_to;
+
+	return found;
+}
+
+static bool recBC1TLDelayChainTarget(u32* branch_to)
+{
+	constexpr int SCAN_LIMIT = 8;
+	u32 scan_pc = pc;
+	u32 candidate_branch_to = *branch_to;
+	bool found = false;
+
+	for (int depth = 0; depth < SCAN_LIMIT; depth++)
+	{
+		const u32 code = *reinterpret_cast<u32*>(PSM(scan_pc));
+		if (!recBC1IsBranch(code, 3))
+			break;
+
+		candidate_branch_to = recBC1BranchTarget(code, scan_pc);
+		scan_pc += 4;
+		found = true;
+	}
+
+	if (recBC1IsBranch(*reinterpret_cast<u32*>(PSM(scan_pc)), 3))
+		return false;
+
+	if (found)
+		*branch_to = candidate_branch_to;
+
+	return found;
+}
+
+void recBC1F()
+{
+	EE::Profiler.EmitOp(eeOpcode::BC1F);
+	const u32 branchTo = ((s32)_Imm_ * 4) + pc;
+	const bool swap = TrySwapDelaySlot(0, 0, 0, true);
+	recBC1BranchTest_emit_oaknut();
+	recDoBranchImmOaknut(branchTo, oak::Cond::NE, false, swap);
+}
+
+void recBC1T()
+{
+	EE::Profiler.EmitOp(eeOpcode::BC1T);
+	u32 branchTo = ((s32)_Imm_ * 4) + pc;
+	const bool swap = recBC1TDelayChainTarget(&branchTo) || TrySwapDelaySlot(0, 0, 0, true);
+	recBC1BranchTest_emit_oaknut();
+	recDoBranchImmOaknut(branchTo, oak::Cond::EQ, false, swap);
+}
+
+void recBC1FL()
+{
+	EE::Profiler.EmitOp(eeOpcode::BC1FL);
+	const u32 branchTo = ((s32)_Imm_ * 4) + pc;
+	recBC1BranchTest_emit_oaknut();
+	recDoBranchImmOaknut(branchTo, oak::Cond::NE, true, false);
+}
+
+void recBC1TL()
+{
+	EE::Profiler.EmitOp(eeOpcode::BC1TL);
+	u32 branchTo = ((s32)_Imm_ * 4) + pc;
+	const bool swap = recBC1TLDelayChainTarget(&branchTo);
+	recBC1BranchTest_emit_oaknut();
+	recDoBranchImmOaknut(branchTo, oak::Cond::EQ, true, swap);
+}
+//------------------------------------------------------------------
+
+
+//------------------------------------------------------------------
+// C.x.S XMM
+//------------------------------------------------------------------
+static void recFpuCompareLoadOperand_emit_oaknut(int dst, int fpu_reg, int cached_reg, bool cached)
+{
+	if (cached)
+	{
+		oakAsm->MOV(oakQRegister(dst).Selem()[0], oakQRegister(cached_reg).Selem()[0]);
+	}
+	else
+	{
+		oakLoad32(OAK_WSCRATCH2, {oak::util::X27, static_cast<s64>(offsetof(cpuRegistersPack, fpuRegs.fpr[fpu_reg].UL))});
+		oakAsm->FMOV(oakSRegister(dst), OAK_WSCRATCH2);
+	}
+}
+
+static void recFpuCompareNormalizeKey_emit_oaknut(int reg)
+{
+	oak::Label not_exp255;
+
+	oakAsm->FMOV(OAK_WSCRATCH, oakSRegister(reg));
+	oakAsm->MOV(OAK_WSCRATCH2, 0x7f800000);
+	oakAsm->AND(OAK_WSCRATCH2, OAK_WSCRATCH, OAK_WSCRATCH2);
+	oakAsm->CMP(OAK_WSCRATCH2, 0);
+	oakAsm->CSEL(OAK_WSCRATCH, oak::util::WZR, OAK_WSCRATCH, oak::util::EQ);
+	oakAsm->MOV(oak::util::W4, 0x7f800000);
+	oakAsm->CMP(OAK_WSCRATCH2, oak::util::W4);
+	oakAsm->B(oak::util::NE, not_exp255);
+	oakAsm->AND(OAK_WSCRATCH, OAK_WSCRATCH, 0x80000000);
+	oakAsm->MOV(oak::util::W4, 0x7f7fffff);
+	oakAsm->ORR(OAK_WSCRATCH, OAK_WSCRATCH, oak::util::W4);
+	oakAsm->l(not_exp255);
+	// -0.0 compares equal to +0.0 (UCOMISS on x86, float compare in the interpreter).
+	oakAsm->MOV(oak::util::W4, 0x80000000);
+	oakAsm->CMP(OAK_WSCRATCH, oak::util::W4);
+	oakAsm->CSEL(OAK_WSCRATCH, oak::util::WZR, OAK_WSCRATCH, oak::util::EQ);
+	oakAsm->TST(OAK_WSCRATCH, 0x80000000);
+	oakAsm->MVN(OAK_WSCRATCH2, OAK_WSCRATCH);
+	oakAsm->ORR(OAK_WSCRATCH, OAK_WSCRATCH, 0x80000000);
+	oakAsm->CSEL(OAK_WSCRATCH, OAK_WSCRATCH2, OAK_WSCRATCH, oak::util::NE);
+	oakAsm->FMOV(oakSRegister(reg), OAK_WSCRATCH);
+}
+
+static void recFpuCompareWriteFlag_emit_oaknut(oak::Cond condition)
+{
+	oakAsm->CSET(OAK_WSCRATCH, condition);
+	oakAsm->LSL(OAK_WSCRATCH, OAK_WSCRATCH, 23);
+	oakLoad32(OAK_WSCRATCH2, {oak::util::X27, static_cast<s64>(offsetof(cpuRegistersPack, fpuRegs.fprc[31]))});
+	oakAsm->MOV(oak::util::W4, ~static_cast<u32>(FPUflagC));
+	oakAsm->AND(OAK_WSCRATCH2, OAK_WSCRATCH2, oak::util::W4);
+	oakAsm->ORR(OAK_WSCRATCH2, OAK_WSCRATCH2, OAK_WSCRATCH);
+	oakStore32(OAK_WSCRATCH2, {oak::util::X27, static_cast<s64>(offsetof(cpuRegistersPack, fpuRegs.fprc[31]))});
+}
+
+static void recC_EQ_emit_oaknut(int info)
+{
+	EE::Profiler.EmitOp(eeOpcode::CEQ_F);
+
+	const int sreg = _allocTempXMMreg(XMMT_FPS);
+	const int treg = _allocTempXMMreg(XMMT_FPS);
+
+	recBeginOaknutEmit();
+	recFpuCompareLoadOperand_emit_oaknut(sreg, _Fs_, EEREC_S, info & PROCESS_EE_S);
+	recFpuCompareLoadOperand_emit_oaknut(treg, _Ft_, EEREC_T, info & PROCESS_EE_T);
+	recFpuCompareNormalizeKey_emit_oaknut(sreg);
+	recFpuCompareNormalizeKey_emit_oaknut(treg);
+	oakAsm->FMOV(OAK_WSCRATCH, oakSRegister(sreg));
+	oakAsm->FMOV(OAK_WSCRATCH2, oakSRegister(treg));
+	oakAsm->CMP(OAK_WSCRATCH, OAK_WSCRATCH2);
+	recFpuCompareWriteFlag_emit_oaknut(oak::util::EQ);
+	recEndOaknutEmit();
+
+	_freeXMMreg(treg);
+	_freeXMMreg(sreg);
+}
+
+void recC_EQ_xmm(int info)
+{
+	recC_EQ_emit_oaknut(info);
+}
+
+FPURECOMPILE_CONSTCODE(C_EQ, XMMINFO_READS | XMMINFO_READT);
+//REC_FPUFUNC(C_EQ);
+
+static void recC_F_emit_oaknut()
+{
+	EE::Profiler.EmitOp(eeOpcode::CF_F);
+
+	recBeginOaknutEmit();
+	oakLoad32(OAK_WSCRATCH2, {oak::util::X27, static_cast<s64>(offsetof(cpuRegistersPack, fpuRegs.fprc[31]))});
+	oakAsm->MOV(OAK_WSCRATCH, ~static_cast<u32>(FPUflagC));
+	oakAsm->AND(OAK_WSCRATCH2, OAK_WSCRATCH2, OAK_WSCRATCH);
+	oakStore32(OAK_WSCRATCH2, {oak::util::X27, static_cast<s64>(offsetof(cpuRegistersPack, fpuRegs.fprc[31]))});
+	recEndOaknutEmit();
+}
+
+void recC_F()
+{
+	recC_F_emit_oaknut();
+}
+//REC_FPUFUNC(C_F);
+
+static void recC_LE_emit_oaknut(int info)
+{
+	EE::Profiler.EmitOp(eeOpcode::CLE_F);
+
+	const int sreg = _allocTempXMMreg(XMMT_FPS);
+	const int treg = _allocTempXMMreg(XMMT_FPS);
+
+	recBeginOaknutEmit();
+	recFpuCompareLoadOperand_emit_oaknut(sreg, _Fs_, EEREC_S, info & PROCESS_EE_S);
+	recFpuCompareLoadOperand_emit_oaknut(treg, _Ft_, EEREC_T, info & PROCESS_EE_T);
+	recFpuCompareNormalizeKey_emit_oaknut(sreg);
+	recFpuCompareNormalizeKey_emit_oaknut(treg);
+	oakAsm->FMOV(OAK_WSCRATCH, oakSRegister(sreg));
+	oakAsm->FMOV(OAK_WSCRATCH2, oakSRegister(treg));
+	oakAsm->CMP(OAK_WSCRATCH, OAK_WSCRATCH2);
+	recFpuCompareWriteFlag_emit_oaknut(oak::util::LS);
+	recEndOaknutEmit();
+
+	_freeXMMreg(treg);
+	_freeXMMreg(sreg);
+}
+
+void recC_LE_xmm(int info)
+{
+	recC_LE_emit_oaknut(info);
+}
+
+FPURECOMPILE_CONSTCODE(C_LE, XMMINFO_READS | XMMINFO_READT);
+//REC_FPUFUNC(C_LE);
+
+static void recC_LT_emit_oaknut(int info)
+{
+	EE::Profiler.EmitOp(eeOpcode::CLT_F);
+
+	const int sreg = _allocTempXMMreg(XMMT_FPS);
+	const int treg = _allocTempXMMreg(XMMT_FPS);
+
+	recBeginOaknutEmit();
+	recFpuCompareLoadOperand_emit_oaknut(sreg, _Fs_, EEREC_S, info & PROCESS_EE_S);
+	recFpuCompareLoadOperand_emit_oaknut(treg, _Ft_, EEREC_T, info & PROCESS_EE_T);
+	recFpuCompareNormalizeKey_emit_oaknut(sreg);
+	recFpuCompareNormalizeKey_emit_oaknut(treg);
+	oakAsm->FMOV(OAK_WSCRATCH, oakSRegister(sreg));
+	oakAsm->FMOV(OAK_WSCRATCH2, oakSRegister(treg));
+	oakAsm->CMP(OAK_WSCRATCH, OAK_WSCRATCH2);
+	recFpuCompareWriteFlag_emit_oaknut(oak::util::CC);
+	recEndOaknutEmit();
+
+	_freeXMMreg(treg);
+	_freeXMMreg(sreg);
+}
+
+void recC_LT_xmm(int info)
+{
+	recC_LT_emit_oaknut(info);
+}
+
+FPURECOMPILE_CONSTCODE(C_LT, XMMINFO_READS | XMMINFO_READT);
+//REC_FPUFUNC(C_LT);
+//------------------------------------------------------------------
+
+
+//------------------------------------------------------------------
+// CVT.x XMM
+//------------------------------------------------------------------
+static void recCVT_S_emit_oaknut(int info)
+{
+	EE::Profiler.EmitOp(eeOpcode::CVTS_F);
+
+	if (info & PROCESS_EE_D)
+	{
+		recBeginOaknutEmit();
+		if (info & PROCESS_EE_S)
+		{
+			oakAsm->SCVTF(oakSRegister(EEREC_D), oakSRegister(EEREC_S));
+		}
+		else
+		{
+			oakLoad32(OAK_WSCRATCH2, {oak::util::X27, static_cast<s64>(offsetof(cpuRegistersPack, fpuRegs.fpr[_Fs_].UL))});
+			oakAsm->SCVTF(oakSRegister(EEREC_D), OAK_WSCRATCH2);
+		}
+		recEndOaknutEmit();
+	}
+	else
+	{
+		const int temp = _allocTempXMMreg(XMMT_FPS);
+
+		recBeginOaknutEmit();
+		if (info & PROCESS_EE_S)
+		{
+			oakAsm->SCVTF(oakSRegister(temp), oakSRegister(EEREC_S));
+		}
+		else
+		{
+			oakLoad32(OAK_WSCRATCH2, {oak::util::X27, static_cast<s64>(offsetof(cpuRegistersPack, fpuRegs.fpr[_Fs_].UL))});
+			oakAsm->SCVTF(oakSRegister(temp), OAK_WSCRATCH2);
+		}
+		oakAsm->FMOV(OAK_WSCRATCH2, oakSRegister(temp));
+		oakStore32(OAK_WSCRATCH2, {oak::util::X27, static_cast<s64>(offsetof(cpuRegistersPack, fpuRegs.fpr[_Fd_].UL))});
+		recEndOaknutEmit();
+
+		_freeXMMreg(temp);
+	}
+}
+
+void recCVT_S_xmm(int info)
+{
+	recCVT_S_emit_oaknut(info);
+}
+
+void recCVT_S()
+{
+	// Float version is fully accurate, no double version
+	eeFPURecompileCode(recCVT_S_xmm, R5900::Interpreter::OpcodeImpl::COP1::CVT_S, XMMINFO_WRITED | XMMINFO_READS);
+}
+
+static void recCVT_W_emit_oaknut()
+{
+	// Float version is fully accurate, no double version
+
+	// If we have the following EmitOP() on the top then it'll get calculated twice when CHECK_FPU_FULL is true
+	// as we also have an EmitOP() at recCVT_W() on iFPUd-arm64.cpp.  hence we have it below the possible return.
+	EE::Profiler.EmitOp(eeOpcode::CVTW);
+
+	const int regs = _checkXMMreg(XMMTYPE_FPREG, _Fs_, MODE_READ);
+
+	// kill register allocation for dst because we write directly to fpuRegs.fpr[_Fd_]
+	_deleteFPtoXMMreg(_Fd_, DELETE_REG_FREE_NO_WRITEBACK);
+
+	recBeginOaknutEmit();
+	if (regs >= 0)
+		oakAsm->FMOV(OAK_WSCRATCH2, oakSRegister(regs));
+	else
+		oakLoad32(OAK_WSCRATCH2, {oak::util::X27, static_cast<s64>(offsetof(cpuRegistersPack, fpuRegs.fpr[_Fs_].UL))});
+
+	oakAsm->FMOV(OAK_SSCRATCH2, OAK_WSCRATCH2);
+	oakAsm->FCVTZS(OAK_WSCRATCH, OAK_SSCRATCH2);
+
+	oakAsm->MOV(oak::util::W4, 0x7fffffff);
+	oakAsm->TST(OAK_WSCRATCH2, 0x80000000);
+	oakAsm->MOV(OAK_WSCRATCH2, 0x80000000);
+	oakAsm->CSEL(oak::util::W4, OAK_WSCRATCH2, oak::util::W4, oak::util::NE);
+	oakAsm->FMOV(OAK_WSCRATCH2, OAK_SSCRATCH2);
+	oakAsm->AND(OAK_WSCRATCH2, OAK_WSCRATCH2, 0x7f800000);
+	oakAsm->MOV(OAK_WSCRATCH, 0x4f000000);
+	oakAsm->CMP(OAK_WSCRATCH2, OAK_WSCRATCH);
+	oak::Label cvt_no_saturate;
+	oak::Label cvt_done;
+	oakAsm->B(oak::util::LO, cvt_no_saturate);
+	oakAsm->MOV(OAK_WSCRATCH, oak::util::W4);
+	oakAsm->B(cvt_done);
+	oakAsm->l(cvt_no_saturate);
+	oakAsm->FCVTZS(OAK_WSCRATCH, OAK_SSCRATCH2);
+	oakAsm->l(cvt_done);
+	oakStore32(OAK_WSCRATCH, {oak::util::X27, static_cast<s64>(offsetof(cpuRegistersPack, fpuRegs.fpr[_Fd_].UL))});
+	recEndOaknutEmit();
+}
+
+void recCVT_W()
+{
+	recCVT_W_emit_oaknut();
+}
+//------------------------------------------------------------------
+
+
+//------------------------------------------------------------------
+// DIV XMM
+//------------------------------------------------------------------
+static void recFpuSetFpcr_emit_oaknut(u64 fpcr)
+{
+	oakAsm->MOV(OAK_XSCRATCH, fpcr);
+	oakAsm->MSR(oak::SystemReg::FPCR, OAK_XSCRATCH);
+	oakAsm->ISB();
+}
+
+static void recFpuLoadConfiguredFpcr_emit_oaknut(s64 offset)
+{
+	oakLoad64(OAK_XSCRATCH, {oak::util::X27, offset});
+	oakAsm->MSR(oak::SystemReg::FPCR, OAK_XSCRATCH);
+	oakAsm->ISB();
+}
+
+static void recDIV_S_emit_oaknut(int info)
+{
+	EE::Profiler.EmitOp(eeOpcode::DIV_F);
+
+	oak::Label nonzero_divisor;
+	oak::Label done;
+	const int sreg = _allocTempXMMreg(XMMT_FPS);
+	const int treg = _allocTempXMMreg(XMMT_FPS);
+	const int srawreg = _allocTempXMMreg(XMMT_FPS);
+	const int trawreg = _allocTempXMMreg(XMMT_FPS);
+
+	recBeginOaknutEmit();
+	recFpuLoadScalarOperand_emit_oaknut(sreg, _Fs_, EEREC_S, info & PROCESS_EE_S);
+	recFpuLoadScalarOperand_emit_oaknut(treg, _Ft_, EEREC_T, info & PROCESS_EE_T);
+	oakAsm->MOV(oakQRegister(srawreg).Selem()[0], oakQRegister(sreg).Selem()[0]);
+	oakAsm->MOV(oakQRegister(trawreg).Selem()[0], oakQRegister(treg).Selem()[0]);
+	{
+		// x86 recDIVhelper1 parity: the divide-by-zero/invalid path runs in
+		// every clamp mode and is the only place DIV touches the I and D flags.
+		recFpuClearFcr31_emit_oaknut(FPUflagD | FPUflagI);
+		oakAsm->FMOV(OAK_WSCRATCH, oakSRegister(trawreg));
+		oakAsm->AND(OAK_WSCRATCH2, OAK_WSCRATCH, 0x7f800000u);
+		oakAsm->CBNZ(OAK_WSCRATCH2, nonzero_divisor);
+
+		// Denormals are divisors of zero on the EE. Preserve the result sign and
+		// select invalid (0/0) versus divide-by-zero from the raw numerator.
+		oakAsm->FMOV(OAK_WSCRATCH2, oakSRegister(srawreg));
+		oakAsm->EOR(OAK_WSCRATCH, OAK_WSCRATCH, OAK_WSCRATCH2);
+		oakAsm->AND(OAK_WSCRATCH, OAK_WSCRATCH, 0x80000000u);
+		oakAsm->MOV(oak::util::W4, 0x7f7fffffu);
+		oakAsm->ORR(OAK_WSCRATCH, OAK_WSCRATCH, oak::util::W4);
+		oakAsm->FMOV(oakSRegister(EEREC_D), OAK_WSCRATCH);
+		oakAsm->AND(OAK_WSCRATCH2, OAK_WSCRATCH2, 0x7f800000u);
+		oakAsm->MOV(OAK_WSCRATCH, FPUflagI | FPUflagSI);
+		oakAsm->MOV(oak::util::W4, FPUflagD | FPUflagSD);
+		oakAsm->CMP(OAK_WSCRATCH2, 0);
+		oakAsm->CSEL(OAK_WSCRATCH, OAK_WSCRATCH, oak::util::W4, oak::util::EQ);
+		oakLoad32(OAK_WSCRATCH2, {oak::util::X27, static_cast<s64>(offsetof(cpuRegistersPack, fpuRegs.fprc[31]))});
+		oakAsm->ORR(OAK_WSCRATCH2, OAK_WSCRATCH2, OAK_WSCRATCH);
+		oakStore32(OAK_WSCRATCH2, {oak::util::X27, static_cast<s64>(offsetof(cpuRegistersPack, fpuRegs.fprc[31]))});
+		oakAsm->B(done);
+	}
+
+	oakAsm->l(nonzero_divisor);
+	recFpuDoubleClampOperand_emit_oaknut(sreg);
+	recFpuDoubleClampOperand_emit_oaknut(treg);
+	if (EmuConfig.Cpu.FPUFPCR.bitmask != EmuConfig.Cpu.FPUDivFPCR.bitmask)
+		recFpuLoadConfiguredFpcr_emit_oaknut(
+			static_cast<s64>(offsetof(cpuRegistersPack, Cpu.FPUDivFPCR.bitmask)));
+	oakAsm->FDIV(oakSRegister(EEREC_D), oakSRegister(sreg), oakSRegister(treg));
+	if (EmuConfig.Cpu.FPUFPCR.bitmask != EmuConfig.Cpu.FPUDivFPCR.bitmask)
+		recFpuLoadConfiguredFpcr_emit_oaknut(
+			static_cast<s64>(offsetof(cpuRegistersPack, Cpu.FPUFPCR.bitmask)));
+	recFpuClampFloat3Operand_emit_oaknut(EEREC_D);
+
+	oakAsm->l(done);
+	recEndOaknutEmit();
+
+	_freeXMMreg(trawreg);
+	_freeXMMreg(srawreg);
+	_freeXMMreg(treg);
+	_freeXMMreg(sreg);
+}
+
+void recDIV_S_xmm(int info)
+{
+	recDIV_S_emit_oaknut(info);
+}
+
+FPURECOMPILE_CONSTCODE(DIV_S, XMMINFO_WRITED | XMMINFO_READS | XMMINFO_READT);
+//------------------------------------------------------------------
+
+
+
+//------------------------------------------------------------------
+// MADD XMM
+//------------------------------------------------------------------
+static void recFpuLoadAccOperand_emit_oaknut(int dst, int cached_reg, bool cached)
+{
+	if (cached)
+	{
+		oakAsm->MOV(oakQRegister(dst).Selem()[0], oakQRegister(cached_reg).Selem()[0]);
+	}
+	else
+	{
+		oakLoad32(OAK_WSCRATCH2, {oak::util::X27, static_cast<s64>(offsetof(cpuRegistersPack, fpuRegs.ACC.UL))});
+		oakAsm->FMOV(oakSRegister(dst), OAK_WSCRATCH2);
+	}
+}
+
+static void recFpuMaddProduct_emit_oaknut(int productreg, int sreg, int treg, bool clamp_product)
+{
+	// x86 recMADDtemp parity: sources are pre-clamped only under Extra, the
+	// product is clamped with fpuFloat under the same gate, and exponent-255
+	// operands otherwise reach the raw multiply.
+	recFpuDoubleClampOperand_emit_oaknut(sreg);
+	recFpuDoubleClampOperand_emit_oaknut(treg);
+	oakAsm->FMUL(oakSRegister(productreg), oakSRegister(sreg), oakSRegister(treg));
+	if (clamp_product && CHECK_FPU_EXTRA_OVERFLOW)
+		recFpuClampFloat3Operand_emit_oaknut(productreg);
+}
+
+
+
+static void recMADD_S_emit_oaknut(int info)
+{
+	EE::Profiler.EmitOp(eeOpcode::MADD_F);
+
+	const int sreg = _allocTempXMMreg(XMMT_FPS);
+	const int treg = _allocTempXMMreg(XMMT_FPS);
+	const int accreg = _allocTempXMMreg(XMMT_FPS);
+	const int productreg = _allocTempXMMreg(XMMT_FPS);
+
+	recBeginOaknutEmit();
+	recFpuLoadScalarOperand_emit_oaknut(sreg, _Fs_, EEREC_S, info & PROCESS_EE_S);
+	recFpuLoadScalarOperand_emit_oaknut(treg, _Ft_, EEREC_T, info & PROCESS_EE_T);
+	recFpuLoadAccOperand_emit_oaknut(accreg, EEREC_ACC, info & PROCESS_EE_ACC);
+	recFpuMaddProduct_emit_oaknut(productreg, sreg, treg, true);
+	if (CHECK_FPU_EXTRA_OVERFLOW)
+		recFpuClampFloat3Operand_emit_oaknut(accreg);
+	recFpuGuardMask_emit_oaknut(accreg, productreg);
+	oakAsm->FADD(oakSRegister(EEREC_D), oakSRegister(accreg), oakSRegister(productreg));
+	recFpuClampFloat3Operand_emit_oaknut(EEREC_D);
+	recEndOaknutEmit();
+
+	_freeXMMreg(productreg);
+	_freeXMMreg(accreg);
+	_freeXMMreg(treg);
+	_freeXMMreg(sreg);
+}
+
+void recMADD_S_xmm(int info)
+{
+	recMADD_S_emit_oaknut(info);
+}
+
+FPURECOMPILE_CONSTCODE(MADD_S, XMMINFO_WRITED | XMMINFO_READACC | XMMINFO_READS | XMMINFO_READT);
+
+static void recMADDA_S_emit_oaknut(int info)
+{
+	EE::Profiler.EmitOp(eeOpcode::MADDA_F);
+
+	const int sreg = _allocTempXMMreg(XMMT_FPS);
+	const int treg = _allocTempXMMreg(XMMT_FPS);
+	const int accreg = _allocTempXMMreg(XMMT_FPS);
+	const int productreg = _allocTempXMMreg(XMMT_FPS);
+
+	recBeginOaknutEmit();
+	recFpuLoadScalarOperand_emit_oaknut(sreg, _Fs_, EEREC_S, info & PROCESS_EE_S);
+	recFpuLoadScalarOperand_emit_oaknut(treg, _Ft_, EEREC_T, info & PROCESS_EE_T);
+	recFpuLoadAccOperand_emit_oaknut(accreg, EEREC_ACC, info & PROCESS_EE_ACC);
+	recFpuMaddProduct_emit_oaknut(productreg, sreg, treg, true);
+	if (CHECK_FPU_EXTRA_OVERFLOW)
+		recFpuClampFloat3Operand_emit_oaknut(accreg);
+	recFpuGuardMask_emit_oaknut(accreg, productreg);
+	oakAsm->FADD(oakSRegister(EEREC_ACC), oakSRegister(accreg), oakSRegister(productreg));
+	recFpuClampFloat3Operand_emit_oaknut(EEREC_ACC);
+	recEndOaknutEmit();
+
+	_freeXMMreg(productreg);
+	_freeXMMreg(accreg);
+	_freeXMMreg(treg);
+	_freeXMMreg(sreg);
+}
+
+void recMADDA_S_xmm(int info)
+{
+	recMADDA_S_emit_oaknut(info);
+}
+
+FPURECOMPILE_CONSTCODE(MADDA_S, XMMINFO_WRITEACC | XMMINFO_READACC | XMMINFO_READS | XMMINFO_READT);
+//------------------------------------------------------------------
+
+
+//------------------------------------------------------------------
+// MAX / MIN XMM
+//------------------------------------------------------------------
+static void recFpuLoadScalarBitsOperand_emit_oaknut(oak::WReg dst, int fpu_reg, int cached_reg, bool cached)
+{
+	if (cached)
+	{
+		oakAsm->FMOV(dst, oakSRegister(cached_reg));
+	}
+	else
+	{
+		oakLoad32(dst, {oak::util::X27, static_cast<s64>(offsetof(cpuRegistersPack, fpuRegs.fpr[fpu_reg].UL))});
+	}
+}
+
+// x86 recCommutativeOp(op 2/3): under CHECK_FPU_OVERFLOW both operands go through
+// fpuFloat2 (= fpuFloat3 sign-preserving clamp), then MAXSS/MINSS; FCR31 untouched.
+// ARM FMAX/FMIN match MAXSS/MINSS for ordered operands (denormals flushed by FPCR.FZ,
+// +-0 ties accepted in either order by the oracle); a NaN operand (only reachable
+// with clamping off) must return the second operand like SSE, so mode 0 adds a
+// FCMP/FCSEL fix-up.
+static void recMaxMin_emit_oaknut(int info, bool is_max)
+{
+	const bool clamp = CHECK_FPU_OVERFLOW;
+	int tmp_s = -1, tmp_t = -1, tmp_r = -1;
+	if (clamp || !(info & PROCESS_EE_S))
+		tmp_s = _allocTempXMMreg(XMMT_FPS);
+	if (clamp || !(info & PROCESS_EE_T))
+		tmp_t = _allocTempXMMreg(XMMT_FPS);
+	if (!clamp)
+		tmp_r = _allocTempXMMreg(XMMT_FPS);
+
+	recBeginOaknutEmit();
+	int sreg = EEREC_S, treg = EEREC_T;
+	if (tmp_s >= 0)
+	{
+		sreg = tmp_s;
+		recFpuLoadScalarOperand_emit_oaknut(sreg, _Fs_, EEREC_S, info & PROCESS_EE_S);
+		if (clamp)
+			recFpuClampSign_emit_oaknut(sreg);
+	}
+	if (tmp_t >= 0)
+	{
+		treg = tmp_t;
+		recFpuLoadScalarOperand_emit_oaknut(treg, _Ft_, EEREC_T, info & PROCESS_EE_T);
+		if (clamp)
+			recFpuClampSign_emit_oaknut(treg);
+	}
+	if (clamp)
+	{
+		if (is_max)
+			oakAsm->FMAX(oakSRegister(EEREC_D), oakSRegister(sreg), oakSRegister(treg));
+		else
+			oakAsm->FMIN(oakSRegister(EEREC_D), oakSRegister(sreg), oakSRegister(treg));
+	}
+	else
+	{
+		oakAsm->FCMP(oakSRegister(sreg), oakSRegister(treg));
+		if (is_max)
+			oakAsm->FMAX(oakSRegister(tmp_r), oakSRegister(sreg), oakSRegister(treg));
+		else
+			oakAsm->FMIN(oakSRegister(tmp_r), oakSRegister(sreg), oakSRegister(treg));
+		oakAsm->FCSEL(oakSRegister(EEREC_D), oakSRegister(tmp_r), oakSRegister(treg), oak::Cond::VC); // unordered -> second operand
+	}
+	recEndOaknutEmit();
+
+	if (tmp_r >= 0)
+		_freeXMMreg(tmp_r);
+	if (tmp_t >= 0)
+		_freeXMMreg(tmp_t);
+	if (tmp_s >= 0)
+		_freeXMMreg(tmp_s);
+}
+
+static void recMAX_S_emit_oaknut(int info)
+{
+	EE::Profiler.EmitOp(eeOpcode::MAX_F);
+	recMaxMin_emit_oaknut(info, true);
+}
+
+void recMAX_S_xmm(int info)
+{
+	recMAX_S_emit_oaknut(info);
+}
+
+FPURECOMPILE_CONSTCODE(MAX_S, XMMINFO_WRITED | XMMINFO_READS | XMMINFO_READT);
+
+static void recMIN_S_emit_oaknut(int info)
+{
+	EE::Profiler.EmitOp(eeOpcode::MIN_F);
+	recMaxMin_emit_oaknut(info, false);
+}
+
+void recMIN_S_xmm(int info)
+{
+	recMIN_S_emit_oaknut(info);
+}
+
+FPURECOMPILE_CONSTCODE(MIN_S, XMMINFO_WRITED | XMMINFO_READS | XMMINFO_READT);
+//------------------------------------------------------------------
+
+
+//------------------------------------------------------------------
+// MOV XMM
+//------------------------------------------------------------------
+static void recMOV_S_emit_oaknut(int info)
+{
+	EE::Profiler.EmitOp(eeOpcode::MOV_F);
+
+	recBeginOaknutEmit();
+	if (info & PROCESS_EE_S)
+	{
+		oakAsm->MOV(oakQRegister(EEREC_D).Selem()[0], oakQRegister(EEREC_S).Selem()[0]);
+	}
+	else
+	{
+		oakLoad32(OAK_WSCRATCH2, {oak::util::X27, static_cast<s64>(offsetof(cpuRegistersPack, fpuRegs.fpr[_Fs_].UL))});
+		oakAsm->FMOV(oakSRegister(EEREC_D), OAK_WSCRATCH2);
+	}
+	recEndOaknutEmit();
+}
+
+void recMOV_S_xmm(int info)
+{
+	recMOV_S_emit_oaknut(info);
+}
+
+FPURECOMPILE_CONSTCODE(MOV_S, XMMINFO_WRITED | XMMINFO_READS);
+//------------------------------------------------------------------
+
+
+//------------------------------------------------------------------
+// MSUB XMM
+//------------------------------------------------------------------
+static void recMSUB_S_emit_oaknut(int info)
+{
+	EE::Profiler.EmitOp(eeOpcode::MSUB_F);
+
+	const int sreg = _allocTempXMMreg(XMMT_FPS);
+	const int treg = _allocTempXMMreg(XMMT_FPS);
+	const int accreg = _allocTempXMMreg(XMMT_FPS);
+	const int productreg = _allocTempXMMreg(XMMT_FPS);
+
+	recBeginOaknutEmit();
+	recFpuLoadScalarOperand_emit_oaknut(sreg, _Fs_, EEREC_S, info & PROCESS_EE_S);
+	recFpuLoadScalarOperand_emit_oaknut(treg, _Ft_, EEREC_T, info & PROCESS_EE_T);
+	recFpuLoadAccOperand_emit_oaknut(accreg, EEREC_ACC, info & PROCESS_EE_ACC);
+	recFpuMaddProduct_emit_oaknut(productreg, sreg, treg, true);
+	if (CHECK_FPU_EXTRA_OVERFLOW)
+		recFpuClampFloat3Operand_emit_oaknut(accreg);
+	recFpuGuardMask_emit_oaknut(accreg, productreg);
+	oakAsm->FSUB(oakSRegister(EEREC_D), oakSRegister(accreg), oakSRegister(productreg));
+	recFpuClampFloat3Operand_emit_oaknut(EEREC_D);
+	recEndOaknutEmit();
+
+	_freeXMMreg(productreg);
+	_freeXMMreg(accreg);
+	_freeXMMreg(treg);
+	_freeXMMreg(sreg);
+}
+
+void recMSUB_S_xmm(int info)
+{
+	recMSUB_S_emit_oaknut(info);
+}
+
+FPURECOMPILE_CONSTCODE(MSUB_S, XMMINFO_WRITED | XMMINFO_READACC | XMMINFO_READS | XMMINFO_READT);
+
+static void recMSUBA_S_emit_oaknut(int info)
+{
+	EE::Profiler.EmitOp(eeOpcode::MSUBA_F);
+
+	const int sreg = _allocTempXMMreg(XMMT_FPS);
+	const int treg = _allocTempXMMreg(XMMT_FPS);
+	const int accreg = _allocTempXMMreg(XMMT_FPS);
+	const int productreg = _allocTempXMMreg(XMMT_FPS);
+
+	recBeginOaknutEmit();
+	recFpuLoadScalarOperand_emit_oaknut(sreg, _Fs_, EEREC_S, info & PROCESS_EE_S);
+	recFpuLoadScalarOperand_emit_oaknut(treg, _Ft_, EEREC_T, info & PROCESS_EE_T);
+	recFpuLoadAccOperand_emit_oaknut(accreg, EEREC_ACC, info & PROCESS_EE_ACC);
+	recFpuMaddProduct_emit_oaknut(productreg, sreg, treg, true);
+	if (CHECK_FPU_EXTRA_OVERFLOW)
+		recFpuClampFloat3Operand_emit_oaknut(accreg);
+	recFpuGuardMask_emit_oaknut(accreg, productreg);
+	oakAsm->FSUB(oakSRegister(EEREC_ACC), oakSRegister(accreg), oakSRegister(productreg));
+	recFpuClampFloat3Operand_emit_oaknut(EEREC_ACC);
+	recEndOaknutEmit();
+
+	_freeXMMreg(productreg);
+	_freeXMMreg(accreg);
+	_freeXMMreg(treg);
+	_freeXMMreg(sreg);
+}
+
+void recMSUBA_S_xmm(int info)
+{
+	recMSUBA_S_emit_oaknut(info);
+}
+
+FPURECOMPILE_CONSTCODE(MSUBA_S, XMMINFO_WRITEACC | XMMINFO_READACC | XMMINFO_READS | XMMINFO_READT);
+//------------------------------------------------------------------
+
+
+//------------------------------------------------------------------
+// MUL XMM
+//------------------------------------------------------------------
+static void recFpuClampFloatResult_emit_oaknut(int regd)
+{
+	// Use pinned s8/s9 (loaded once at JIT entry) instead of per-instruction materialization.
+	// Saves 4 instructions per clamp (MOV+FMOV eliminated).
+	if (CHECK_FPU_OVERFLOW)
+	{
+		oakAsm->FMINNM(oakSRegister(regd), oakSRegister(regd), oak::SReg(8));
+		oakAsm->FMAXNM(oakSRegister(regd), oakSRegister(regd), oak::SReg(9));
+	}
+}
+
+static void recFpuFinishMulResult_emit_oaknut(int regd)
+{
+	recFpuClampFloatResult_emit_oaknut(regd);
+}
+
+static void recFpuMulExact_emit_oaknut(int info, int regd)
+{
+	const int sreg = _allocTempXMMreg(XMMT_FPS);
+	const int treg = _allocTempXMMreg(XMMT_FPS);
+
+	recBeginOaknutEmit();
+	recFpuLoadScalarOperand_emit_oaknut(sreg, _Fs_, EEREC_S, info & PROCESS_EE_S);
+	recFpuLoadScalarOperand_emit_oaknut(treg, _Ft_, EEREC_T, info & PROCESS_EE_T);
+	if (CHECK_FPUMULHACK)
+	{
+		oak::Label no_hack;
+		oak::Label done;
+
+		oakAsm->FMOV(OAK_WSCRATCH, oakSRegister(sreg));
+		oakAsm->MOV(OAK_WSCRATCH2, 0x3e800000u);
+		oakAsm->CMP(OAK_WSCRATCH, OAK_WSCRATCH2);
+		oakAsm->B(oak::util::NE, no_hack);
+		oakAsm->FMOV(OAK_WSCRATCH, oakSRegister(treg));
+		oakAsm->MOV(OAK_WSCRATCH2, 0x40490fdbu);
+		oakAsm->CMP(OAK_WSCRATCH, OAK_WSCRATCH2);
+		oakAsm->B(oak::util::NE, no_hack);
+		oakAsm->MOV(OAK_WSCRATCH, 0x3f490fda);
+		oakAsm->FMOV(oakSRegister(regd), OAK_WSCRATCH);
+		oakAsm->B(done);
+
+		oakAsm->l(no_hack);
+		recFpuMaddProduct_emit_oaknut(regd, sreg, treg, false);
+		oakAsm->l(done);
+	}
+	else
+	{
+		recFpuMaddProduct_emit_oaknut(regd, sreg, treg, false);
+	}
+	recFpuFinishMulResult_emit_oaknut(regd);
+	recEndOaknutEmit();
+
+	_freeXMMreg(treg);
+	_freeXMMreg(sreg);
+}
+
+static void recMUL_S_emit_oaknut(int info)
+{
+	EE::Profiler.EmitOp(eeOpcode::MUL_F);
+	recFpuMulExact_emit_oaknut(info, EEREC_D);
+}
+
+void recMUL_S_xmm(int info)
+{
+	recMUL_S_emit_oaknut(info);
+}
+
+FPURECOMPILE_CONSTCODE(MUL_S, XMMINFO_WRITED | XMMINFO_READS | XMMINFO_READT);
+
+static void recMULA_S_emit_oaknut(int info)
+{
+	EE::Profiler.EmitOp(eeOpcode::MULA_F);
+	recFpuMulExact_emit_oaknut(info, EEREC_ACC);
+}
+
+void recMULA_S_xmm(int info)
+{
+	recMULA_S_emit_oaknut(info);
+}
+
+FPURECOMPILE_CONSTCODE(MULA_S, XMMINFO_WRITEACC | XMMINFO_READS | XMMINFO_READT);
+//------------------------------------------------------------------
+
+
+//------------------------------------------------------------------
+// NEG XMM
+//------------------------------------------------------------------
+static void recNEG_S_emit_oaknut(int info)
+{
+	EE::Profiler.EmitOp(eeOpcode::NEG_F);
+
+	// x86 recNEG_S_xmm: flip the sign, always apply the sign-preserving fpuFloat3
+	// clamp (+-Inf/NaN -> +-max, regardless of the clamp mode), leave FCR31 alone.
+	recBeginOaknutEmit();
+	if (info & PROCESS_EE_S)
+		oakAsm->FMOV(OAK_WSCRATCH, oakSRegister(EEREC_S));
+	else
+		oakLoad32(OAK_WSCRATCH, {oak::util::X27, static_cast<s64>(offsetof(cpuRegistersPack, fpuRegs.fpr[_Fs_].UL))});
+	oakAsm->EOR(OAK_WSCRATCH, OAK_WSCRATCH, 0x80000000u);
+	oakAsm->FMOV(oakSRegister(EEREC_D), OAK_WSCRATCH);
+	recFpuClampSign_emit_oaknut(EEREC_D);
+	recEndOaknutEmit();
+}
+
+void recNEG_S_xmm(int info)
+{
+	recNEG_S_emit_oaknut(info);
+}
+
+FPURECOMPILE_CONSTCODE(NEG_S, XMMINFO_WRITED | XMMINFO_READS);
+//------------------------------------------------------------------
+
+
+//------------------------------------------------------------------
+// SUB XMM
+//------------------------------------------------------------------
+static void recSUB_S_emit_oaknut(int info)
+{
+	EE::Profiler.EmitOp(eeOpcode::SUB_F);
+
+	const int sreg = _allocTempXMMreg(XMMT_FPS);
+	const int treg = _allocTempXMMreg(XMMT_FPS);
+	const bool d_aliases_s = (_Fd_ == _Fs_);
+	const bool d_aliases_t = (_Fd_ == _Ft_);
+
+	if (d_aliases_s)
+		recFpuFlushCachedOperandToMemory(_Fs_);
+	if (d_aliases_t && _Ft_ != _Fs_)
+		recFpuFlushCachedOperandToMemory(_Ft_);
+
+	recBeginOaknutEmit();
+	if (d_aliases_s)
+		recFpuLoadScalarMemoryOperand_emit_oaknut(sreg, _Fs_);
+	else
+		recFpuLoadScalarOperand_emit_oaknut(sreg, _Fs_, EEREC_S, info & PROCESS_EE_S);
+	if (d_aliases_t)
+		recFpuLoadScalarMemoryOperand_emit_oaknut(treg, _Ft_);
+	else
+		recFpuLoadScalarOperand_emit_oaknut(treg, _Ft_, EEREC_T, info & PROCESS_EE_T);
+	recFpuDoubleClampOperand_emit_oaknut(sreg);
+	recFpuDoubleClampOperand_emit_oaknut(treg);
+	recFpuGuardMask_emit_oaknut(sreg, treg);
+	oakAsm->FSUB(oakSRegister(EEREC_D), oakSRegister(sreg), oakSRegister(treg));
+	recFpuClampFloat3Operand_emit_oaknut(EEREC_D);
+	recEndOaknutEmit();
+
+	_freeXMMreg(treg);
+	_freeXMMreg(sreg);
+}
+
+void recSUB_S_xmm(int info)
+{
+	recSUB_S_emit_oaknut(info);
+}
+
+FPURECOMPILE_CONSTCODE(SUB_S, XMMINFO_WRITED | XMMINFO_READD | XMMINFO_READS | XMMINFO_READT);
+
+
+static void recSUBA_S_emit_oaknut(int info)
+{
+	EE::Profiler.EmitOp(eeOpcode::SUBA_F);
+
+	const int sreg = _allocTempXMMreg(XMMT_FPS);
+	const int treg = _allocTempXMMreg(XMMT_FPS);
+
+	recBeginOaknutEmit();
+	recFpuLoadScalarOperand_emit_oaknut(sreg, _Fs_, EEREC_S, info & PROCESS_EE_S);
+	recFpuLoadScalarOperand_emit_oaknut(treg, _Ft_, EEREC_T, info & PROCESS_EE_T);
+	recFpuDoubleClampOperand_emit_oaknut(sreg);
+	recFpuDoubleClampOperand_emit_oaknut(treg);
+	recFpuGuardMask_emit_oaknut(sreg, treg);
+	oakAsm->FSUB(oakSRegister(EEREC_ACC), oakSRegister(sreg), oakSRegister(treg));
+	recFpuClampFloat3Operand_emit_oaknut(EEREC_ACC);
+	recEndOaknutEmit();
+
+	_freeXMMreg(treg);
+	_freeXMMreg(sreg);
+}
+
+void recSUBA_S_xmm(int info)
+{
+	recSUBA_S_emit_oaknut(info);
+}
+
+FPURECOMPILE_CONSTCODE(SUBA_S, XMMINFO_WRITEACC | XMMINFO_READS | XMMINFO_READT);
+//------------------------------------------------------------------
+
+
+//------------------------------------------------------------------
+// SQRT XMM
+//------------------------------------------------------------------
+static void recSQRT_S_emit_oaknut(int info)
+{
+	EE::Profiler.EmitOp(eeOpcode::SQRT_F);
+
+	// x86 recSQRT_S_xmm: clear I/D, a set sign bit (including -0 and negative
+	// denormals) raises I|SI, the sign is dropped (SQRT(-0) = +0), CHECK_FPU_OVERFLOW
+	// maps Inf/NaN to +max, SQRT runs in nearest, Extra clamps the result.
+	FPControlRegister sqrt_fpcr = EmuConfig.Cpu.FPUFPCR;
+	sqrt_fpcr.SetRoundMode(FPRoundMode::Nearest);
+
+	recBeginOaknutEmit();
+	recFpuLoadScalarBitsOperand_emit_oaknut(OAK_WSCRATCH, _Ft_, EEREC_T, info & PROCESS_EE_T);
+	oakLoad32(OAK_WSCRATCH2, {oak::util::X27, static_cast<s64>(offsetof(cpuRegistersPack, fpuRegs.fprc[31]))});
+	oakAsm->MOV(oak::util::W4, ~(FPUflagI | FPUflagD));
+	oakAsm->AND(OAK_WSCRATCH2, OAK_WSCRATCH2, oak::util::W4);
+	oakAsm->MOV(oak::util::W4, FPUflagI | FPUflagSI);
+	oakAsm->TST(OAK_WSCRATCH, 0x80000000u);
+	oakAsm->CSEL(oak::util::W4, oak::util::W4, oak::util::WZR, oak::util::NE);
+	oakAsm->ORR(OAK_WSCRATCH2, OAK_WSCRATCH2, oak::util::W4);
+	oakStore32(OAK_WSCRATCH2, {oak::util::X27, static_cast<s64>(offsetof(cpuRegistersPack, fpuRegs.fprc[31]))});
+	oakAsm->AND(OAK_WSCRATCH, OAK_WSCRATCH, 0x7fffffffu);
+	if (CHECK_FPU_OVERFLOW)
+	{
+		oakAsm->MOV(OAK_WSCRATCH2, 0x7f7fffffu);
+		oakAsm->CMP(OAK_WSCRATCH, OAK_WSCRATCH2);
+		oakAsm->CSEL(OAK_WSCRATCH, OAK_WSCRATCH, OAK_WSCRATCH2, oak::Cond::LS);
+	}
+	oakAsm->FMOV(oakSRegister(EEREC_D), OAK_WSCRATCH);
+	if (EmuConfig.Cpu.FPUFPCR.bitmask != sqrt_fpcr.bitmask)
+		recFpuSetFpcr_emit_oaknut(sqrt_fpcr.bitmask);
+	oakAsm->FSQRT(oakSRegister(EEREC_D), oakSRegister(EEREC_D));
+	if (EmuConfig.Cpu.FPUFPCR.bitmask != sqrt_fpcr.bitmask)
+		recFpuSetFpcr_emit_oaknut(EmuConfig.Cpu.FPUFPCR.bitmask);
+	if (CHECK_FPU_EXTRA_OVERFLOW)
+		recFpuClampFloat3Operand_emit_oaknut(EEREC_D);
+	recEndOaknutEmit();
+}
+
+void recSQRT_S_xmm(int info)
+{
+	recSQRT_S_emit_oaknut(info);
+}
+
+FPURECOMPILE_CONSTCODE(SQRT_S, XMMINFO_WRITED | XMMINFO_READT);
+//------------------------------------------------------------------
+
+
+//------------------------------------------------------------------
+// RSQRT XMM
+//------------------------------------------------------------------
+static void recRSQRT_S_emit_oaknut(int info)
+{
+	EE::Profiler.EmitOp(eeOpcode::RSQRT_F);
+
+	// x86 recRSQRThelper1: Ft is made positive (I|SI if it was negative), Ft == 0
+	// (DAZ) gives +-max with the sign of Fs and I|SI for 0/0 else D|SD, otherwise
+	// Fs / sqrt(Ft) in the current rounding mode with Extra operand clamps and the
+	// fpuFloat result clamp.
+	const int treg = _allocTempXMMreg(XMMT_FPS);
+
+	oak::Label nonzero;
+	oak::Label done;
+
+	recBeginOaknutEmit();
+	recFpuLoadScalarBitsOperand_emit_oaknut(OAK_WSCRATCH, _Ft_, EEREC_T, info & PROCESS_EE_T);
+	recFpuLoadScalarOperand_emit_oaknut(EEREC_D, _Fs_, EEREC_S, info & PROCESS_EE_S);
+	oakLoad32(OAK_WSCRATCH2, {oak::util::X27, static_cast<s64>(offsetof(cpuRegistersPack, fpuRegs.fprc[31]))});
+	oakAsm->MOV(oak::util::W4, ~(FPUflagI | FPUflagD));
+	oakAsm->AND(OAK_WSCRATCH2, OAK_WSCRATCH2, oak::util::W4);
+	oakAsm->MOV(oak::util::W4, FPUflagI | FPUflagSI);
+	oakAsm->TST(OAK_WSCRATCH, 0x80000000u);
+	oakAsm->CSEL(oak::util::W4, oak::util::W4, oak::util::WZR, oak::util::NE);
+	oakAsm->ORR(OAK_WSCRATCH2, OAK_WSCRATCH2, oak::util::W4);
+	oakAsm->AND(OAK_WSCRATCH, OAK_WSCRATCH, 0x7fffffffu);
+	oakAsm->TST(OAK_WSCRATCH, 0x7f800000u);
+	oakAsm->B(oak::util::NE, nonzero);
+
+	// Ft is (denormal-as-)zero.
+	oakAsm->FMOV(oak::util::W4, oakSRegister(EEREC_D));
+	oakAsm->MOV(OAK_WARG1, FPUflagI | FPUflagSI);
+	oakAsm->MOV(OAK_WARG2, FPUflagD | FPUflagSD);
+	oakAsm->TST(oak::util::W4, 0x7f800000u);
+	oakAsm->CSEL(OAK_WARG1, OAK_WARG1, OAK_WARG2, oak::util::EQ);
+	oakAsm->ORR(OAK_WSCRATCH2, OAK_WSCRATCH2, OAK_WARG1);
+	oakStore32(OAK_WSCRATCH2, {oak::util::X27, static_cast<s64>(offsetof(cpuRegistersPack, fpuRegs.fprc[31]))});
+	oakAsm->AND(oak::util::W4, oak::util::W4, 0x80000000u);
+	oakAsm->MOV(OAK_WSCRATCH, 0x7f7fffffu);
+	oakAsm->ORR(oak::util::W4, oak::util::W4, OAK_WSCRATCH);
+	oakAsm->FMOV(oakSRegister(EEREC_D), oak::util::W4);
+	oakAsm->B(done);
+
+	oakAsm->l(nonzero);
+	oakStore32(OAK_WSCRATCH2, {oak::util::X27, static_cast<s64>(offsetof(cpuRegistersPack, fpuRegs.fprc[31]))});
+	if (CHECK_FPU_EXTRA_OVERFLOW)
+	{
+		oakAsm->MOV(OAK_WSCRATCH2, 0x7f7fffffu);
+		oakAsm->CMP(OAK_WSCRATCH, OAK_WSCRATCH2);
+		oakAsm->CSEL(OAK_WSCRATCH, OAK_WSCRATCH, OAK_WSCRATCH2, oak::Cond::LS);
+		recFpuClampSign_emit_oaknut(EEREC_D);
+	}
+	oakAsm->FMOV(oakSRegister(treg), OAK_WSCRATCH);
+	oakAsm->FSQRT(oakSRegister(treg), oakSRegister(treg));
+	oakAsm->FDIV(oakSRegister(EEREC_D), oakSRegister(EEREC_D), oakSRegister(treg));
+	recFpuClampFloat3Operand_emit_oaknut(EEREC_D);
+	oakAsm->l(done);
+	recEndOaknutEmit();
+
+	_freeXMMreg(treg);
+}
+
+void recRSQRT_S_xmm(int info)
+{
+	recRSQRT_S_emit_oaknut(info);
+}
+
+FPURECOMPILE_CONSTCODE(RSQRT_S, XMMINFO_WRITED | XMMINFO_READS | XMMINFO_READT);
+
+} // namespace COP1
+} // namespace OpcodeImpl
+} // namespace Dynarec
+} // namespace R5900

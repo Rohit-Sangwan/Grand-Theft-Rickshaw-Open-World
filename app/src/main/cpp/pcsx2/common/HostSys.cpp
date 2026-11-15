@@ -1,0 +1,188 @@
+// SPDX-FileCopyrightText: 2002-2026 PCSX2 Dev Team
+// SPDX-License-Identifier: GPL-3.0+
+
+#include "HostSys.h"
+#include "Console.h"
+#include "VectorIntrin.h"
+
+#ifdef __ANDROID__
+#include <android/set_abort_message.h>
+#endif
+
+#ifndef __APPLE__
+#include "cpuinfo.h"
+#endif
+
+static void MultiPause()
+{
+#ifdef ARCH_X86
+	_mm_pause();
+	_mm_pause();
+	_mm_pause();
+	_mm_pause();
+	_mm_pause();
+	_mm_pause();
+	_mm_pause();
+	_mm_pause();
+#elif defined(ARCH_ARM64) && defined(_MSC_VER)
+	__yield();
+	__yield();
+	__yield();
+	__yield();
+	__yield();
+	__yield();
+	__yield();
+	__yield();
+#elif defined(ARCH_ARM64)
+	__asm__ __volatile__("yield" ::: "memory");
+	__asm__ __volatile__("yield" ::: "memory");
+	__asm__ __volatile__("yield" ::: "memory");
+	__asm__ __volatile__("yield" ::: "memory");
+	__asm__ __volatile__("yield" ::: "memory");
+	__asm__ __volatile__("yield" ::: "memory");
+	__asm__ __volatile__("yield" ::: "memory");
+	__asm__ __volatile__("yield" ::: "memory");
+#else
+#error Unknown architecture.
+#endif
+}
+
+static u32 MeasurePauseTime()
+{
+	// GetCPUTicks may have resolution as low as 1µs
+	// One call to MultiPause could take anywhere from 20ns (fast Haswell) to 400ns (slow Skylake)
+	// We want a measurement of reasonable resolution, but don't want to take too long
+	// So start at a fairly small number and increase it if it's too fast
+	for (int testcnt = 64; true; testcnt *= 2)
+	{
+		u64 start = GetCPUTicks();
+		for (int i = 0; i < testcnt; i++)
+		{
+			MultiPause();
+		}
+		u64 time = GetCPUTicks() - start;
+		if (time > 100)
+		{
+			u64 nanos = (time * 1000000000) / GetTickFrequency();
+			return (nanos / testcnt) + 1;
+		}
+	}
+}
+
+__noinline static u32 InitializePauseTime()
+{
+#if !defined(ARCH_ARM64)
+	u64 wait = GetCPUTicks() + GetTickFrequency() / 100; // Wake up processor (spin for 10ms)
+	while (GetCPUTicks() < wait)
+		;
+#endif
+	u32 pause = MeasurePauseTime();
+	// Take a few measurements in case something weird happens during one
+	// (e.g. OS interrupt)
+	for (int i = 0; i < 4; i++)
+		pause = std::min(pause, MeasurePauseTime());
+	DevCon.WriteLn("MultiPause time: %uns", pause);
+	return pause;
+}
+
+u32 ShortSpin()
+{
+	// Function-local static initialization is thread-safe, unlike the old global
+	// load/store pair when multiple worker threads reached ShortSpin together.
+	static const u32 pause_time = InitializePauseTime();
+	const u32 inc = pause_time;
+
+	u32 time = 0;
+	// Sleep for approximately 500ns
+	for (; time < 500; time += inc)
+		MultiPause();
+
+	return time;
+}
+
+static u32 GetSpinTime()
+{
+	if (char* req = getenv("WAIT_SPIN_MICROSECONDS"))
+	{
+		return 1000 * atoi(req);
+	}
+	else
+	{
+		return 50 * 1000; // 50µs
+	}
+}
+
+const u32 SPIN_TIME_NS = GetSpinTime();
+
+#ifdef __APPLE__
+// https://alastairs-place.net/blog/2013/01/10/interesting-os-x-crash-report-tidbits/
+// https://opensource.apple.com/source/WebKit2/WebKit2-7608.3.10.0.3/Platform/spi/Cocoa/CrashReporterClientSPI.h.auto.html
+struct crash_info_t
+{
+	u64 version;
+	u64 message;
+	u64 signature;
+	u64 backtrace;
+	u64 message2;
+	u64 reserved;
+	u64 reserved2;
+};
+#define CRASH_ANNOTATION __attribute__((used, section("__DATA,__crash_info")))
+#define CRASH_VERSION 4
+extern "C" crash_info_t gCRAnnotations CRASH_ANNOTATION = { CRASH_VERSION };
+#endif
+
+void AbortWithMessage(const char* msg)
+{
+#ifdef __ANDROID__
+	// Logcat alone is not retained in Play's native reports. debuggerd reads this
+	// message into the tombstone, preserving the assertion's file, line and condition.
+	android_set_abort_message(msg ? msg : "EmuCoreX fatal error");
+#endif
+#ifdef __APPLE__
+	gCRAnnotations.message = reinterpret_cast<size_t>(msg);
+	// Some macOS's seem to have issues displaying non-static `message`s, so throw it in here too
+	gCRAnnotations.backtrace = gCRAnnotations.message;
+#endif
+	abort();
+}
+
+#ifndef __APPLE__
+// MacOS version is in DarwinMisc
+static CPUInfo CalcCPUInfo()
+{
+	CPUInfo out;
+	out.name = cpuinfo_get_package(0)->name;
+	out.num_threads = cpuinfo_get_processors_count();
+	out.num_clusters = cpuinfo_get_clusters_count();
+	out.num_big_cores = 0;
+	out.num_small_cores = 0;
+	const cpuinfo_cluster* clusters = cpuinfo_get_clusters();
+	uint64_t big_freq = 0;
+	for (uint32_t i = 0; i < out.num_clusters; i++)
+	{
+		const cpuinfo_cluster& cluster = clusters[i];
+		if (cluster.frequency > big_freq)
+		{
+			out.num_small_cores += out.num_big_cores;
+			out.num_big_cores = cluster.core_count;
+			big_freq = cluster.frequency;
+		}
+		else if (cluster.frequency == big_freq)
+		{
+			out.num_big_cores += cluster.core_count;
+		}
+		else
+		{
+			out.num_small_cores += cluster.core_count;
+		}
+	}
+	return out;
+}
+
+const CPUInfo& GetCPUInfo()
+{
+	static const CPUInfo info = CalcCPUInfo();
+	return info;
+}
+#endif

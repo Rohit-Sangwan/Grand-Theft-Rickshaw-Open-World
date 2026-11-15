@@ -1,0 +1,484 @@
+// SPDX-FileCopyrightText: 2002-2025 PCSX2 Dev Team
+// SPDX-License-Identifier: GPL-3.0+
+
+#pragma once
+
+
+
+#include <deque>
+#include <algorithm>
+#include <memory>
+#include <string>
+#include <unordered_map>
+#include <vector>
+#include "Common.h"
+#include "VU.h"
+#include "MTVU.h"
+#include "GS.h"
+#include "Gif_Unit.h"
+#include "arm64/ee/iR5900-arm64.h"
+#include "arm64/ir/IrLower-arm64.h"
+#include "R5900OpcodeTables.h"
+#include "common/emitter/x86emitter.h"
+#include "arm64/vu/microVU_Misc-arm64.h"
+#include "microVU_IR-arm64.h"
+#include "arm64/vuaot/VuAotMvuTrace.h"
+#include "arm64/vuaot/VuAotRuntime.h"
+#include "common/Perf.h"
+
+class microBlockManager;
+
+struct microBlockLink
+{
+	microBlock block;
+	microBlockLink* next;
+};
+
+struct microBlockLinkRef
+{
+	microBlock* pBlock;
+	u64 quick;
+};
+
+struct microRange
+{
+	s32 start; // Start PC (The opcode the block starts at)
+	s32 end;   // End PC   (The opcode the block ends with)
+};
+
+#define mProgSize (0x4000 >> 2)         // (0x4000 / 4)
+#define mProgSizeHalf (mProgSize >> 1)  // mProgSize / 2
+
+struct MvuContentKey
+{
+	u64 low64;
+	u64 high64;
+	u32 start_pc;
+
+	bool operator==(const MvuContentKey& rhs) const noexcept
+	{
+		return low64 == rhs.low64 && high64 == rhs.high64 && start_pc == rhs.start_pc;
+	}
+};
+
+struct MvuContentKeyHash
+{
+	size_t operator()(const MvuContentKey& key) const noexcept
+	{
+		u64 mixed = key.low64 ^ (key.high64 + 0x9e3779b97f4a7c15ULL +
+			(key.low64 << 6) + (key.low64 >> 2));
+		mixed ^= static_cast<u64>(key.start_pc) + 0x9e3779b97f4a7c15ULL + (mixed << 6) + (mixed >> 2);
+		return static_cast<size_t>(mixed);
+	}
+};
+
+struct MvuPersistLog;
+struct microProgram
+{
+	MvuPersistLog* persist; // Native baseline emission log; owned by mVUPersist.
+	u32                data [mProgSize];     // Holds a copy of the VU microProgram
+	microBlockManager* block[mProgSizeHalf]; // Array of Block Managers
+	std::deque<microRange>* ranges;          // The ranges of the microProgram that have already been recompiled
+	u32 startPC; // Start PC of this program
+	int idx;     // Program index
+	MvuContentKey contentKey;
+	u64 contentWriteGeneration;
+	bool contentKeyValid;
+};
+
+typedef std::deque<microProgram*> microProgramList;
+
+struct microProgramQuick
+{
+	microProgram* prog; // The microProgram ordered first for this startPC
+};
+
+struct microProgManager
+{
+	microIR<mProgSize> IRinfo;             // IR information
+	microProgramList*  prog [mProgSizeHalf]; // List of microPrograms indexed by startPC values
+	microProgramQuick  quick[mProgSizeHalf]; // Quick reference to valid microPrograms for current execution
+	microProgram*      cur;                // Pointer to currently running MicroProgram
+	int                total;              // Total Number of valid MicroPrograms
+	int                isSame;             // Current cached microProgram is Exact Same program as mVU.regs().Micro (-1 = unknown, 0 = No, 1 = Yes)
+	int                cleared;            // Micro Program is Indeterminate so must be searched for (and if no matches are found then recompile a new one)
+	u32                curFrame;           // Frame Counter
+	u8*                x86ptr;             // Pointer to program's recompilation code
+	u8*                x86start;           // Start of program's rec-cache
+	u8*                x86end;             // Cleanup threshold; safe zone continues to the physical rec-cache end
+	microRegInfo       lpState;            // Pipeline state from where program left off (useful for continuing execution)
+
+	// Dense, non-owning index of non-null quick slots. Only the search miss
+	// paths populate quick entries; generated code still reads quick directly.
+	u16 activeQuick[mProgSizeHalf];
+	u32 activeQuickCount = 0;
+
+	void cacheQuick(u32 slot, microProgram* program)
+	{
+		pxAssert(slot < mProgSizeHalf && program);
+		if (!quick[slot].prog)
+		{
+			pxAssert(activeQuickCount < mProgSizeHalf);
+			activeQuick[activeQuickCount++] = static_cast<u16>(slot);
+		}
+		quick[slot].prog = program;
+	}
+
+	void clearQuick()
+	{
+		std::memset(quick, 0, sizeof(quick));
+		activeQuickCount = 0;
+	}
+};
+
+// Space past x86end which an in-flight compile may use before dispatcher-exit
+// cleanup can reset the cache. It is not part of the normal allocation budget.
+static const uint mVUcacheSafeZone = 3; // Megabytes
+
+struct microVU
+{
+
+	alignas(16) u32 statFlag[4]; // 4 instances of status flag (backup for xgkick)
+	alignas(16) u32 macFlag [4]; // 4 instances of mac    flag (used in execution)
+	alignas(16) u32 clipFlag[4]; // 4 instances of clip   flag (used in execution)
+	alignas(16) u32 xmmBackup[16][4]; // Backup for xmm0~xmm15
+	alignas(16) u32 aotBackup[32][4]; // Region spills and ABI call preservation; separate from baseline.
+
+	// Hot scalar state. Generated code touches these constantly: the block-entry
+	// guard reads/writes `cycles` on every block, branches park results in
+	// `branch`, xgkick uses `totalCycles`/`VIxgkick`. `prog` below is hundreds of
+	// kilobytes, so keeping this cluster ahead of it is what lets the JIT reach
+	// them with one split-immediate LDR/STR instead of a MOVZ/MOVK+ADD sequence
+	// per access.
+	u32 code;         // Contains the current Instruction
+	u32 divFlag;      // 1 instance of I/D flags
+	u32 VIbackup;     // Holds a backup of a VI reg if modified before a branch
+	u32 VIxgkick;     // Holds a backup of a VI reg used for xgkick-delays
+	u32 branch;       // Holds branch compare result (IBxx) OR Holds address to Jump to (JALR/JR)
+	// Pool GPR holding a live IBxx condition result, or -1. Cleared wherever the
+	// pool may be clobbered (end-program emission, per-block compile) so the Cmp
+	// in condBranch only ever reads a register that survived the delay slot.
+	int branchCondCarryGpr = -1;
+	u32 badBranch;    // For Branches in Branch Delay Slots, holds Address the first Branch went to + 8
+	u32 evilBranch;   // For Branches in Branch Delay Slots, holds Address to Jump to
+	u32 evilevilBranch;// For Branches in Branch Delay Slots (chained), holds Address to Jump to
+	u32 p;            // Holds current P instance index
+	u32 q;            // Holds current Q instance index
+	u32 totalCycles;  // Total Cycles that mVU is expected to run for
+	s32 cycles;       // Cycles Counter
+
+	// Set when the block being compiled can reach a program end (E-bit), either
+	// directly or through a successor the flag lookahead found. mVUsetFlags then
+	// forces just the last flag-writing instruction to write MAC and STATUS, so
+	// mVUendProgram finalises a written ring instance instead of a stale one.
+	// Compile-scoped: reset in mVUinitFirstPass.
+	bool needFlagFinalize;
+
+	u32 index;        // VU Index (VU0 or VU1)
+	u32 cop2;         // VU is in COP2 mode?  (No/Yes)
+	u32 vuMemSize;    // VU Main  Memory Size (in bytes)
+	u32 microMemSize; // VU Micro Memory Size (in bytes)
+	u32 progSize;     // VU Micro Memory Size (in u32's)
+	u32 progMemMask;  // VU Micro Memory Size (in u32's)
+	u32 cacheSize;    // VU Cache Size
+
+	// Micro Program Data. Lives in vuRegistersPack rather than inside microVU:
+	// the manager is hundreds of kilobytes (IR arrays, per-PC lists), and
+	// keeping it in-struct pushed every JIT-accessed scalar (cycles, branch,
+	// flags) past the range of a single split-immediate load/store, which made
+	// every access a MOVZ/MOVK+ADD+LDR sequence. A reference member keeps all
+	// existing mVU.prog.* uses working while microVU itself stays small.
+	microProgManager& prog;
+
+	explicit microVU(microProgManager& prog_ref) : prog(prog_ref) {}
+
+	std::unique_ptr<microRegAlloc> regAlloc; // Reg Alloc Class
+	u8* cache;        // Dynarec Cache Start (where we will start writing the recompiled code to)
+	u8* startFunct;   // Function Ptr to the recompiler dispatcher (start)
+	u8* exitFunct;    // Function Ptr to the recompiler dispatcher (exit)
+	u8* startFunctXG; // Function Ptr to the recompiler dispatcher (xgkick resume)
+	u8* exitFunctXG;  // Function Ptr to the recompiler dispatcher (xgkick exit)
+	u8* compareStateF;// Function Ptr to search which compares all state.
+	u8* waitMTVU;     // Ptr to function to save registers/sync VU1 thread
+	u8* copyPLState;  // Ptr to function to copy pipeline state into microVU
+	u8* budgetExitStub; // Ptr to shared block-entry budget-break exit stub (see mVUGenerateBudgetExitStub)
+	u8* resumePtrXG;  // Ptr to recompiled code position to resume xgkick
+
+	// The content map owns live programs. The entry PC is part of the key so
+	// indirect-jump targets remain separate programs; merging them makes ranges
+	// grow until small micro-memory uploads invalidate nearly the entire cache.
+	// Per-start-PC lists and quick slots only reference these programs.
+	std::unordered_map<MvuContentKey, microProgram*, MvuContentKeyHash> contentPrograms;
+	std::vector<microProgram*> orphanedPrograms;
+	u64 microMemWriteGeneration = 0;
+
+//	VURegs& regs() const { return ::vuRegs[index]; }
+    VURegs& regs() const { return ::g_cpuRegistersPack.vuRegs[index]; }
+
+	__fi REG_VI& getVI(uint reg) const { return regs().VI[reg]; }
+	__fi VECTOR& getVF(uint reg) const { return regs().VF[reg]; }
+	__fi VIFregisters& getVifRegs() const
+	{
+		return (index && THREAD_VU1) ? vu1Thread.vifRegs : regs().GetVifRegs();
+	}
+
+	__fi u32 compareState(microRegInfo* lhs, microRegInfo* rhs) const {
+		return reinterpret_cast<u32(*)(void*, void*)>(compareStateF)(lhs, rhs);
+	}
+};
+
+static __fi void mVUclearBranchCondCarry(microVU& mVU)
+{
+	mVU.branchCondCarryGpr = -1;
+}
+
+class microBlockManager
+{
+private:
+	microBlockLink *qBlockList, *qBlockEnd; // Quick Search
+	microBlockLink *fBlockList, *fBlockEnd; // Full  Search
+	std::vector<microBlockLinkRef> quickLookup;
+	int qListI, fListI;
+
+public:
+	inline int getFullListCount() const { return fListI; }
+	inline size_t getQuickLookupCount() const { return quickLookup.size(); }
+	inline microBlockLink* getQBlockList() const { return qBlockList; }
+	inline microBlockLink* getFBlockList() const { return fBlockList; }
+	microBlockManager()
+	{
+		qListI = fListI = 0;
+		qBlockEnd = qBlockList = nullptr;
+		fBlockEnd = fBlockList = nullptr;
+	}
+	~microBlockManager() { reset(); }
+	void reset()
+	{
+		for (microBlockLink* linkI = qBlockList; linkI != nullptr;)
+		{
+			microBlockLink* freeI = linkI;
+			safe_delete_array(linkI->block.jumpCache);
+			linkI = linkI->next;
+			_aligned_free(freeI);
+		}
+		for (microBlockLink* linkI = fBlockList; linkI != nullptr;)
+		{
+			microBlockLink* freeI = linkI;
+			safe_delete_array(linkI->block.jumpCache);
+			linkI = linkI->next;
+			_aligned_free(freeI);
+		}
+		qListI = fListI = 0;
+		qBlockEnd = qBlockList = nullptr;
+		fBlockEnd = fBlockList = nullptr;
+		quickLookup.clear();
+	};
+	microBlock* add(microVU& mVU, microBlock* pBlock)
+	{
+		microBlock* thisBlock = search(mVU, &pBlock->pState);
+		if (!thisBlock)
+		{
+			u8 fullCmp = pBlock->pState.needExactMatch;
+			if (fullCmp)
+				fListI++;
+			else
+				qListI++;
+
+            microBlockLink*& blockList = fullCmp ? fBlockList : qBlockList;
+            microBlockLink*& blockEnd  = fullCmp ? fBlockEnd  : qBlockEnd;
+            microBlockLink*  newBlock  = (microBlockLink*)_aligned_malloc(sizeof(microBlockLink), 32);
+
+			newBlock->block.jumpCache  = nullptr;
+			newBlock->next             = nullptr;
+
+			if (blockEnd)
+			{
+				blockEnd->next = newBlock;
+				blockEnd       = newBlock;
+			}
+			else
+			{
+				blockEnd = blockList = newBlock;
+			}
+
+			std::memcpy(&newBlock->block, pBlock, sizeof(microBlock));
+			newBlock->block.execution_count = 0;
+			newBlock->block.guest_size = 0;
+			newBlock->block.host_size = 0;
+			thisBlock = &newBlock->block;
+
+			quickLookup.push_back({&newBlock->block, pBlock->pState.quick64[0]});
+		}
+		return thisBlock;
+	}
+
+    typedef u32 (*mVUCall)(u32, void*, void*);
+	__ri microBlock* search(microVU& mVU, microRegInfo* pState)
+	{
+		if (pState->needExactMatch) // Needs Detailed Search (Exact Match of Pipeline State)
+		{
+			microBlockLink* prevI = nullptr;
+			for (microBlockLink* linkI = fBlockList; linkI != nullptr; prevI = linkI, linkI = linkI->next)
+			{
+//				if (mVU.compareState(pState, &linkI->block.pState) == 0)
+                if (((mVUCall(mVU.compareStateF)(0, pState, &linkI->block.pState)) == 0))
+				{
+					if (linkI != fBlockList)
+					{
+						// A later add appends through fBlockEnd. When the promoted
+						// node was the tail, its predecessor is the new tail.
+						if (mVUlocalRuleEnabled(20) && linkI == fBlockEnd)
+							fBlockEnd = prevI;
+						prevI->next = linkI->next;
+						linkI->next = fBlockList;
+						fBlockList = linkI;
+					}
+
+					return &linkI->block;
+				}
+			}
+		}
+		else // Can do Simple Search (Only Matches the Important Pipeline Stuff)
+		{
+			const u64 quick64 = pState->quick64[0];
+			for (const microBlockLinkRef& ref : quickLookup)
+			{
+				// if we're using the flag hack, ignore the mac flags going in to the new block too if an exact match wasn't requested.
+				if (mVUsFlagHack)
+				{
+					if ((ref.quick & ~0x0C04) != (quick64 & ~0x0C04)) continue;
+				}
+				else if (ref.quick != quick64) continue;
+
+				if (doConstProp && (ref.pBlock->pState.vi15 != pState->vi15))  continue;
+				if (doConstProp && (ref.pBlock->pState.vi15v != pState->vi15v)) continue;
+				return ref.pBlock;
+			}
+		}
+		return nullptr;
+	}
+	void printInfo(int pc, bool printQuick)
+	{
+	}
+};
+
+static __fi u8 mVUcanonicalViBackup(const microRegInfo& state)
+{
+	return (state.viBackUp && !state.VI[state.viBackUp]) ? 0 : state.viBackUp;
+}
+
+static __fi u8 mVUcanonicalFlagInfo(const microRegInfo& state)
+{
+	u8 flagInfo = state.flagInfo;
+	if (!(state.needExactMatch & 2))
+		flagInfo &= ~0x30;
+	if (state.needExactMatch & 1)
+		flagInfo &= ~0x0c;
+	if (state.needExactMatch & 2)
+		flagInfo &= ~0x30;
+	if (state.needExactMatch & 4)
+		flagInfo &= ~0xc0;
+	return flagInfo;
+}
+
+// The canonical pipe state only ever changes viBackUp and flagInfo, so compare
+// those two fields instead of materializing a 96-byte copy and memcmp'ing it.
+// The search state is the hot VU0 program-entry path; the untouched case lets
+// the caller keep using the original pointer without the stack traffic.
+static __fi microRegInfo* mVUcanonicalizeSearchState(microRegInfo* state, microRegInfo& storage)
+{
+	const u8 viBackUp = mVUcanonicalViBackup(*state);
+	const u8 flagInfo = mVUcanonicalFlagInfo(*state);
+	if (viBackUp == state->viBackUp && flagInfo == state->flagInfo)
+		return state;
+
+	storage = *state;
+	storage.viBackUp = viBackUp;
+	storage.flagInfo = flagInfo;
+	return &storage;
+}
+
+// microVU rec structs
+//alignas(16) microVU microVU0;
+//alignas(16) microVU microVU1;
+
+struct vuRegistersPack
+{
+    alignas(16) microVU microVU[2];
+    // Program managers live after the VU structs so that every hot microVU field
+    // stays in the first few KiB, reachable by a single split-immediate access.
+    // The VU references below are only bound here; the storage itself is touched
+    // only after construction.
+    alignas(64) microProgManager prog[2];
+    alignas(64) VU_Thread vu1Thread;
+
+    vuRegistersPack()
+        : microVU{::microVU(prog[0]), ::microVU(prog[1])}
+    {
+    }
+};
+alignas(64) extern vuRegistersPack g_vuRegistersPack;
+////
+static microVU& microVU0 = g_vuRegistersPack.microVU[0];
+static microVU& microVU1 = g_vuRegistersPack.microVU[1];
+
+// Main Functions
+extern void mVUclear(mV, u32, u32);
+extern void mVUreset(microVU& mVU, bool resetReserve, bool vu1Idle = false);
+extern void* mVUblockFetch(microVU& mVU, u32 startPC, uptr pState);
+_mVUt extern void* mVUcompileJIT(u32 startPC, uptr ptr);
+
+// Prototypes for Linux
+extern void mVUcleanUpVU0();
+extern void mVUcleanUpVU1();
+mVUop(mVUopU);
+mVUop(mVUopL);
+
+// Private Functions
+extern void mVUcacheProg(microVU& mVU, microProgram& prog);
+extern void mVUdeleteProg(microVU& mVU, microProgram*& prog);
+_mVUt extern void* mVUsearchProg(u32 startPC, uptr pState);
+extern void* mVUexecuteVU0(u32 startPC, u32 cycles);
+extern void* mVUexecuteVU1(u32 startPC, u32 cycles);
+
+// recCall Function Pointer
+typedef void (*mVUrecCall)(u32, u32);
+typedef void (*mVUrecCallXG)(void);
+
+template <typename T>
+void makeUnique(T& v)
+{ // Removes Duplicates
+	v.erase(unique(v.begin(), v.end()), v.end());
+}
+
+template <typename T>
+void sortVector(T& v)
+{
+	sort(v.begin(), v.end());
+}
+
+bool mVUSharedIrEnabled(u32 index);
+void mVURecordSharedIr(u32 index, u32 host_bytes, bool immediate = false, bool transfer = false);
+void mVURecordSharedMfir(u32 index, u32 host_bytes);
+void mVURecordSharedMr32(u32 index, u32 host_bytes);
+void mVURecordSharedAbs(u32 index, u32 host_bytes);
+void mVURecordSharedItof(u32 index, u32 host_bytes);
+void mVURecordSharedFtoi(u32 index, u32 host_bytes);
+void mVURecordSharedMaxMin(u32 index, u32 host_bytes);
+void mVURecordSharedMaxMinBroadcast(u32 index, u32 host_bytes, u32 selector, bool maximum);
+void mVURecordSharedMaxMinI(u32 index, u32 host_bytes, bool maximum);
+void mVURecordSharedClip(u32 index, u32 host_bytes);
+
+// Include all the *.inl files (microVU compiles as 1 Translation Unit)
+#include "microVU_Misc-arm64.inl"
+#include "microVU_Analyze-arm64.inl"
+#include "microVU_Alloc-arm64.inl"
+#include "microVU_Clamp-arm64.inl"
+#include "microVU_Upper-arm64.inl"
+#include "microVU_Lower-arm64.inl"
+#include "microVU_Tables-arm64.inl"
+#include "microVU_Flags-arm64.inl"
+#include "microVU_Branch-arm64.inl"
+#include "microVU_Compile-arm64.inl"
+#include "microVU_Execute-arm64.inl"
+#include "microVU_Macro-arm64.inl"

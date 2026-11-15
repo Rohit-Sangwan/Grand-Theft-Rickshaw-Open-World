@@ -1,0 +1,2259 @@
+// SPDX-FileCopyrightText: 2002-2025 PCSX2 Dev Team
+// SPDX-License-Identifier: GPL-3.0+
+
+#include "arm64/iop/iR3000A-arm64.h"
+#include "R3000A.h"
+#include "arm64/iop/IopIrLifter-arm64.h"
+#include "arm64/ir/IrLower-arm64.h"
+#include <array>
+#if defined(__ANDROID__)
+#include <android/log.h>
+#include <sys/system_properties.h>
+#endif
+#include "arm64/ee/BaseblockEx-arm64.h"
+#include "R5900OpcodeTables.h"
+#include "OpcodeFamilies.h"
+#include "IopBios.h"
+#include "IopHw.h"
+#include "Common.h"
+#include "VMManager.h"
+#include "IopThread/EeBridge.h"
+
+#include <time.h>
+
+#ifndef _WIN32
+#include <sys/types.h>
+#endif
+
+#include "arm64/ee/iCore-arm64.h"
+
+#include "Config.h"
+#include "arm64/OaknutHelpers-arm64.h"
+#include "JitProfiler.h"
+#include "HangTrace.h"
+
+#include "common/AlignedMalloc.h"
+#include "common/FileSystem.h"
+#include "common/Path.h"
+#include "common/Perf.h"
+#include "DebugTools/Breakpoints.h"
+
+
+#if !defined(__ANDROID__)
+using namespace x86Emitter;
+#endif
+
+#if defined(EMUCOREX_ENABLE_NATIVE_SELF_TESTS) ||     (defined(EMUCOREX_ENABLE_EXPERIMENTAL_IR) && EMUCOREX_ENABLE_EXPERIMENTAL_IR)
+#define EMUCOREX_IOP_IR_COMPILED 1
+#endif
+
+#ifdef EMUCOREX_IOP_IR_COMPILED
+static u64 s_iopIrInstructions = 0;
+static u64 s_iopIrSpillSequences = 0;
+static u64 s_iopIrMemoryOperations = 0;
+static u64 s_iopIrDirectLoads = 0;
+static u64 s_iopIrMulDivInstructions = 0;
+static u64 s_iopIrBranches = 0;
+static u64 s_iopIrCop0Instructions = 0;
+static u64 s_iopIrCop2Instructions = 0;
+#if defined(EMUCOREX_ENABLE_NATIVE_SELF_TESTS)
+static int s_iopIrOverride = -1;
+static u64 s_iopIrNclipCompiles = 0;
+static u64 s_iopIrNclipFusions = 0;
+static u64 s_iopIrAvszFusions = 0;
+static u64 s_iopIrAvsz3Compiles = 0, s_iopIrAvsz4Compiles = 0;
+extern "C" void EmuCoreXOracleSetIOPIR(int enabled) { s_iopIrOverride = enabled < 0 ? -1 : (enabled != 0); }
+extern "C" u64 EmuCoreXOracleIOPIRInstructions() { return s_iopIrInstructions; }
+extern "C" u64 EmuCoreXOracleIOPIRSpillSequences() { return s_iopIrSpillSequences; }
+extern "C" u64 EmuCoreXOracleIOPIRMemoryOperations() { return s_iopIrMemoryOperations; }
+extern "C" u64 EmuCoreXOracleIOPIRDirectLoads() { return s_iopIrDirectLoads; }
+extern "C" u64 EmuCoreXOracleIOPIRMulDivInstructions() { return s_iopIrMulDivInstructions; }
+extern "C" u64 EmuCoreXOracleIOPIRBranches() { return s_iopIrBranches; }
+extern "C" u64 EmuCoreXOracleIOPIRCop0Instructions() { return s_iopIrCop0Instructions; }
+extern "C" u64 EmuCoreXOracleIOPIRCop2Instructions() { return s_iopIrCop2Instructions; }
+extern "C" u64 EmuCoreXOracleIopIrNclipCompiles() { return s_iopIrNclipCompiles; }
+extern "C" u64 EmuCoreXOracleIopIrAvszFusions() { return s_iopIrAvszFusions; }
+extern "C" u64 EmuCoreXOracleIopIrNclipFusions() { return s_iopIrNclipFusions; }
+extern "C" void EmuCoreXOracleGetIopIrGteAvszCounts(u64* avsz3, u64* avsz4)
+{
+    if (avsz3) *avsz3 = s_iopIrAvsz3Compiles;
+    if (avsz4) *avsz4 = s_iopIrAvsz4Compiles;
+}
+#endif
+
+static bool IopIrEnabled()
+{
+#if defined(__ANDROID__) && defined(EMUCOREX_ENABLE_NATIVE_SELF_TESTS) && \
+    defined(EMUCOREX_ENABLE_EXPERIMENTAL_IR) && EMUCOREX_ENABLE_EXPERIMENTAL_IR
+    if (s_iopIrOverride >= 0) return s_iopIrOverride != 0;
+    static const bool enabled = []() {
+        char value[PROP_VALUE_MAX] = {};
+        const bool result = __system_property_get("debug.emucorex.iop_ir", value) == 1 && value[0] == '1';
+        __android_log_print(ANDROID_LOG_INFO, "IOPIR", "enabled=%u property=debug.emucorex.iop_ir", result ? 1u : 0u);
+        return result;
+    }();
+    return enabled;
+#else
+    return false;
+#endif
+}
+
+static bool IopIrDirectLoadsEnabled()
+{
+#if defined(__ANDROID__) && defined(EMUCOREX_ENABLE_NATIVE_SELF_TESTS)
+    static const bool enabled = []() {
+        char value[PROP_VALUE_MAX] = {};
+        return !(__system_property_get("debug.emucorex.iop_ir_direct_loads", value) == 1 && value[0] == '0');
+    }();
+    return enabled;
+#else
+    return true;
+#endif
+}
+
+static bool IopIrNativeDivisionEnabled()
+{
+#if defined(__ANDROID__) && defined(EMUCOREX_ENABLE_NATIVE_SELF_TESTS)
+    static const bool enabled = []() {
+        char value[PROP_VALUE_MAX] = {};
+        return !(__system_property_get("debug.emucorex.iop_ir_native_div", value) == 1 && value[0] == '0');
+    }();
+    return enabled;
+#else
+    return true;
+#endif
+}
+#endif // EMUCOREX_IOP_IR_COMPILED
+
+extern void psxBREAK();
+
+u32 g_psxMaxRecMem = 0;
+
+alignas(16) uptr psxRecLUT[0x10000];
+u32 psxhwLUT[0x10000];
+
+static __fi u32 HWADDR(u32 mem) { return psxhwLUT[mem >> 16] + mem; }
+
+static BASEBLOCK* recRAM = nullptr; // and the ptr to the blocks here
+static BASEBLOCK* recROM = nullptr; // and here
+static BASEBLOCK* recROM1 = nullptr; // also here
+static BASEBLOCK* recROM2 = nullptr; // also here
+static BaseBlocks recBlocks;
+static u8* recPtr = nullptr;
+static u8* recPtrEnd = nullptr;
+u32 psxpc; // recompiler psxpc
+int psxbranch; // set for branch
+u32 g_iopCyclePenalty;
+
+static EEINST* s_pInstCache = nullptr;
+static u32 s_nInstCacheSize = 0;
+
+static BASEBLOCK* s_pCurBlock = nullptr;
+static BASEBLOCKEX* s_pCurBlockEx = nullptr;
+
+static u32 s_nEndBlock = 0; // what psxpc the current block ends
+static u32 s_branchTo;
+static bool s_nBlockFF;
+
+static u32 s_saveConstRegs[32];
+static u32 s_saveHasConstReg = 0, s_saveFlushedConstReg = 0;
+static EEINST* s_psaveInstInfo = nullptr;
+
+u32 s_psxBlockCycles = 0; // cycles of current block recompiling
+static u32 s_savenBlockCycles = 0;
+static bool s_recompilingDelaySlot = false;
+
+static void iPsxBranchTest(u32 newpc, u32 cpuBranch);
+//void psxRecompileNextInstruction(int delayslot);
+
+extern void (*rpsxBSC[64])();
+void rpsxpropBSC(EEINST* prev, EEINST* pinst);
+
+static void iopClearRecLUT(BASEBLOCK* base, int count);
+
+#define PSX_GETBLOCK(x) PC_GETBLOCK_(x, psxRecLUT)
+
+#define PSXREC_CLEARM(mem) \
+	(((mem) < g_psxMaxRecMem && (psxRecLUT[(mem) >> 16] + (mem))) ? \
+			psxRecClearMem(mem) : \
+            4)
+
+// IOP JIT maps only a subset of the 32-bit address space (RAM/ROM via the
+// 0x0000/0x8000/0xA000 bases). Any other PC (KUSEG aliases like 0x20000000,
+// HW registers, gaps) has a null LUT entry. Dereferencing PSX_GETBLOCK for
+// such a PC faults with address pc*2 (e.g. 0x40000030), the top native
+// crash in Android Vitals (iopRecRecompile). Guard every dereference.
+static __fi bool iopRecPageIsMapped(u32 pc)
+{
+	return psxRecLUT[pc >> 16] != 0;
+}
+
+// Redirect an unmapped alias to its canonical mapped counterpart when it
+// addresses the same physical RAM/ROM (matches iopMemRead32 masking with
+// 0x1fffffff). Returns 0 when there is no executable mapping.
+static u32 iopRecCanonicalPC(u32 pc)
+{
+	if (iopRecPageIsMapped(pc))
+		return pc;
+	const u32 phys = pc & 0x1fffffffu;
+	if (iopRecPageIsMapped(phys))
+		return phys;
+	return 0;
+}
+
+// Fast-forward over unmapped executable space. The interpreter reads 0 (NOP)
+// there, so straight-line code would single-step for megabytes. Skip whole
+// 64K pages at once while keeping cycle accounting identical to N NOPs.
+static void iopRecSkipUnmappedPC(u32 startpc)
+{
+	u32 next = startpc + 4;
+	for (int guard = 0; guard < 0x10000; ++guard)
+	{
+		if (iopRecPageIsMapped(next))
+			break;
+		const u32 phys = next & 0x1fffffffu;
+		if (iopRecPageIsMapped(phys))
+		{
+			next = phys;
+			break;
+		}
+		const u32 nextPage = (next >> 16) + 1;
+		if (nextPage >= 0x10000)
+		{
+			next = 0;
+			break;
+		}
+		next = nextPage << 16;
+		if (next == 0)
+			break;
+	}
+
+	u64 skipped;
+	if (next >= startpc)
+		skipped = (static_cast<u64>(next) - startpc) >> 2;
+	else
+		skipped = ((0x100000000ull - startpc) >> 2) + (next >> 2);
+	if (skipped == 0)
+		skipped = 1;
+
+	psxRegs.pc = next;
+	psxRegs.cycle += static_cast<u32>(skipped);
+	if (!(psxHu32(HW_ICFG) & (1 << 3)))
+	{
+		psxRegs.iopCycleEE -= static_cast<s32>(skipped * 8);
+	}
+	else
+	{
+		const u32 cnum = 1280;
+		const u32 cdenom = 147;
+		const u64 t = (static_cast<u64>(cnum) * skipped) + psxRegs.iopCycleEECarry;
+		psxRegs.iopCycleEE -= static_cast<s32>(t / cdenom);
+		psxRegs.iopCycleEECarry = static_cast<u32>(t % cdenom);
+	}
+}
+
+
+// =====================================================================================================
+//  Dynamically Compiled Dispatchers - R3000A style
+// =====================================================================================================
+
+static void iopRecRecompile(u32 startpc);
+
+static const void* iopDispatcherEvent = nullptr;
+static const void* iopDispatcherReg = nullptr;
+static const void* iopJITCompile = nullptr;
+static const void* iopEnterRecompiledCode = nullptr;
+static const void* iopExitRecompiledCode = nullptr;
+
+#if defined(EMUCOREX_ENABLE_NATIVE_SELF_TESTS)
+extern "C" int EmuCoreXOracleSkipEvents();
+#endif
+
+static void recEventTest()
+{
+#if defined(EMUCOREX_ENABLE_NATIVE_SELF_TESTS)
+	if (EmuCoreXOracleSkipEvents())
+		return;
+#endif
+	_cpuEventTest_Shared();
+}
+
+static void iopOakBeginStackFrame()
+{
+	using namespace oak::util;
+
+#if defined(__ANDROID__)
+	// X20-X23 are the only callee-saved registers available to the Android IOP
+	// allocator. X26/X27/X29 are pinned for RAM, CPU state, and the block LUT;
+	// X30 holds the native return address. The old frame also saved X19/X24/X25/X28,
+	// none of which can be modified by IOP-generated code.
+	oakAsm->SUB(SP, SP, 64);
+	oakAsm->STP(X20, X21, SP, oak::SOffset<10, 3>(0));
+	oakAsm->STP(X22, X23, SP, oak::SOffset<10, 3>(16));
+	oakAsm->STP(X26, X27, SP, oak::SOffset<10, 3>(32));
+	oakAsm->STP(X29, X30, SP, oak::SOffset<10, 3>(48));
+#else
+	oakAsm->SUB(SP, SP, 144);
+	oakAsm->STP(X19, X20, SP, oak::SOffset<10, 3>(32));
+	oakAsm->STP(X21, X22, SP, oak::SOffset<10, 3>(48));
+	oakAsm->STP(X23, X24, SP, oak::SOffset<10, 3>(64));
+	oakAsm->STP(X25, X26, SP, oak::SOffset<10, 3>(80));
+	oakAsm->STP(X27, X28, SP, oak::SOffset<10, 3>(96));
+	oakAsm->STP(X29, X30, SP, oak::SOffset<10, 3>(112));
+#endif
+}
+
+static void iopOakEndStackFrame()
+{
+	using namespace oak::util;
+
+#if defined(__ANDROID__)
+	oakAsm->LDP(X29, X30, SP, oak::SOffset<10, 3>(48));
+	oakAsm->LDP(X26, X27, SP, oak::SOffset<10, 3>(32));
+	oakAsm->LDP(X22, X23, SP, oak::SOffset<10, 3>(16));
+	oakAsm->LDP(X20, X21, SP, oak::SOffset<10, 3>(0));
+	oakAsm->ADD(SP, SP, 64);
+#else
+	oakAsm->LDP(X29, X30, SP, oak::SOffset<10, 3>(112));
+	oakAsm->LDP(X27, X28, SP, oak::SOffset<10, 3>(96));
+	oakAsm->LDP(X25, X26, SP, oak::SOffset<10, 3>(80));
+	oakAsm->LDP(X23, X24, SP, oak::SOffset<10, 3>(64));
+	oakAsm->LDP(X21, X22, SP, oak::SOffset<10, 3>(48));
+	oakAsm->LDP(X19, X20, SP, oak::SOffset<10, 3>(32));
+	oakAsm->ADD(SP, SP, 144);
+#endif
+}
+
+static void iopOakLoadCurrentPc()
+{
+	oakLoad32(oak::util::W0, {oak::util::X27, static_cast<s64>(offsetof(cpuRegistersPack, psxRegs.pc))});
+}
+
+static void iopOakEmitDispatcherRegBody()
+{
+	using namespace oak::util;
+
+	iopOakLoadCurrentPc();
+	oakAsm->LSR(W1, W0, 16);
+	oakAsm->LDR(X1, X29, X1, oak::IndexExt::LSL, 3);
+	// Unmapped pages have a null LUT entry. Route them to the JIT compiler
+	// entry instead of faulting on the indexed load below; iopRecRecompile
+	// canonicalizes aliases or fast-forwards over gaps.
+	oak::Label mapped;
+	oakAsm->CBNZ(X1, mapped);
+	oakMoveAddressToReg(X2, &iopJITCompile);
+	oakAsm->LDR(X2, X2);
+	oakAsm->BR(X2);
+	oakAsm->l(mapped);
+	oakAsm->LSR(W0, W0, 2);
+	oakAsm->LDR(X0, X1, X0, oak::IndexExt::LSL, 3);
+	oakAsm->BR(X0);
+}
+
+// The address for all cleared blocks.  It recompiles the current pc and then
+// dispatches to the recompiled block address.
+static const void* _DynGen_JITCompile()
+{
+	pxAssertMsg(iopDispatcherReg != NULL, "Please compile the DispatcherReg subroutine *before* JITComple.  Thanks.");
+
+//	u8* retval = xGetPtr();
+	u8* retval = oakGetCurrentCodePointer();
+
+	iopOakLoadCurrentPc();
+	oakEmitCall(reinterpret_cast<void*>(iopRecRecompile));
+
+
+	iopOakEmitDispatcherRegBody();
+
+	return retval;
+}
+
+// called when jumping to variable pc address
+static const void* _DynGen_DispatcherReg()
+{
+//	u8* retval = xGetPtr();
+	u8* retval = oakGetCurrentCodePointer();
+
+
+	iopOakEmitDispatcherRegBody();
+
+	return retval;
+}
+
+// --------------------------------------------------------------------------------------
+//  EnterRecompiledCode  - dynamic compilation stub!
+// --------------------------------------------------------------------------------------
+static const void* _DynGen_EnterRecompiledCode()
+{
+	using namespace oak::util;
+
+	// Optimization: The IOP never uses stack-based parameter invocation, so we can avoid
+	// allocating any room on the stack for it (which is important since the IOP's entry
+	// code gets invoked quite a lot).
+
+	u8* retval = oakGetCurrentCodePointer();
+
+	{ // Properly scope the frame prologue/epilogue
+#ifdef ENABLE_VTUNE
+		xScopedStackFrame frame(true, true);
+#else
+		iopOakBeginStackFrame();
+#endif
+		oakMoveAddressToReg(X26, iopMem->Main);
+		oakMoveAddressToReg(X27, &g_cpuRegistersPack);
+		oakMoveAddressToReg(X29, &psxRecLUT);
+
+		oakEmitJmp(iopDispatcherReg);
+
+		// Save an exit point
+		iopExitRecompiledCode = oakGetCurrentCodePointer();
+
+		iopOakEndStackFrame();
+	}
+
+	oakAsm->RET();
+
+	return retval;
+}
+
+static void _DynGen_Dispatchers()
+{
+//	const u8* start = xGetAlignedCallTarget();
+	const u8* start = oakGetCurrentCodePointer();
+
+	// Place the EventTest and DispatcherReg stuff at the top, because they get called the
+	// most and stand to benefit from strong alignment and direct referencing.
+	iopDispatcherEvent = oakGetCurrentCodePointer();
+	oakEmitCall(reinterpret_cast<void *>(recEventTest));
+	iopDispatcherReg = _DynGen_DispatcherReg();
+
+	iopJITCompile = _DynGen_JITCompile();
+	iopEnterRecompiledCode = _DynGen_EnterRecompiledCode();
+
+	recBlocks.SetJITCompile(iopJITCompile);
+
+	Perf::any.Register(start, oakGetCurrentCodePointer() - start, "IOP Dispatcher Oaknut");
+}
+
+////////////////////////////////////////////////////
+using namespace R3000A;
+
+#define IOP_CPU(field) OakMemOperand{oak::util::X27, static_cast<s64>(offsetof(cpuRegistersPack, field))}
+
+static constexpr oak::WReg OAK_EAX = oak::util::W0;
+static constexpr oak::WReg OAK_ECX = oak::util::W1;
+static constexpr oak::WReg OAK_EDX = oak::util::W2;
+static constexpr oak::WReg OAK_EBX = oak::util::W3;
+static constexpr oak::WReg OAK_EEX = oak::util::W4;
+
+void _psxFlushConstReg(int reg)
+{
+	if (PSX_IS_CONST1(reg) && !(g_psxFlushedConstReg & (1 << reg)))
+	{
+		oakAsm->MOV(OAK_WSCRATCH, g_psxConstRegs[reg]);
+		oakStore32(OAK_WSCRATCH, IOP_CPU(psxRegs.GPR.r[reg]));
+		g_psxFlushedConstReg |= (1 << reg);
+	}
+}
+
+void _psxFlushConstRegs()
+{
+	// TODO: Combine flushes
+
+	int i;
+
+	// flush constants
+
+	// ignore r0
+	for (i = 1; i < 32; ++i)
+	{
+		if (g_psxHasConstReg & (1 << i))
+		{
+
+			if (!(g_psxFlushedConstReg & (1 << i)))
+			{
+				oakAsm->MOV(OAK_WSCRATCH, g_psxConstRegs[i]);
+				oakStore32(OAK_WSCRATCH, IOP_CPU(psxRegs.GPR.r[i]));
+				g_psxFlushedConstReg |= 1 << i;
+			}
+
+			if (g_psxHasConstReg == g_psxFlushedConstReg)
+				break;
+		}
+	}
+}
+
+void _psxDeleteReg(int reg, int flush)
+{
+	if (!reg)
+		return;
+	if (flush && PSX_IS_CONST1(reg))
+		_psxFlushConstReg(reg);
+
+	PSX_DEL_CONST(reg);
+	_deletePSXtoX86reg(reg, flush ? DELETE_REG_FREE : DELETE_REG_FREE_NO_WRITEBACK);
+}
+
+void _psxMoveGPRtoR(oak::WReg to, int fromgpr)
+{
+	if (PSX_IS_CONST1(fromgpr))
+	{
+		oakAsm->MOV(to, g_psxConstRegs[fromgpr]);
+	}
+	else
+	{
+		const int reg = EEINST_USEDTEST(fromgpr) ? _allocX86reg(X86TYPE_PSX, fromgpr, MODE_READ) : _checkX86reg(X86TYPE_PSX, fromgpr, MODE_READ);
+		if (reg >= 0)
+			oakAsm->MOV(to, oakWRegister(reg));
+		else
+			oakLoad32(to, IOP_CPU(psxRegs.GPR.r[fromgpr]));
+	}
+}
+
+void _psxMoveGPRtoM(OakMemOperand to, int fromgpr)
+{
+	if (PSX_IS_CONST1(fromgpr))
+	{
+		oakAsm->MOV(OAK_WSCRATCH, g_psxConstRegs[fromgpr]);
+		oakStore32(OAK_WSCRATCH, to);
+	}
+	else
+	{
+		const int reg = EEINST_USEDTEST(fromgpr) ? _allocX86reg(X86TYPE_PSX, fromgpr, MODE_READ) : _checkX86reg(X86TYPE_PSX, fromgpr, MODE_READ);
+		if (reg >= 0)
+			oakStore32(oakWRegister(reg), to);
+		else
+		{
+			oakLoad32(OAK_EAX, IOP_CPU(psxRegs.GPR.r[fromgpr]));
+			oakStore32(OAK_EAX, to);
+		}
+	}
+}
+
+void _psxFlushCall(int flushtype)
+{
+	// Free ARM64 host registers that are not saved across function calls:
+	for (u32 i = 0; i < iREGCNT_GPR; i++)
+	{
+		if (!x86regs[i].inuse)
+			continue;
+
+		if (oakIsCallerSaved(i) ||
+			((flushtype & FLUSH_FREE_NONTEMP_X86) && x86regs[i].type != X86TYPE_TEMP) ||
+			((flushtype & FLUSH_FREE_TEMP_X86) && x86regs[i].type == X86TYPE_TEMP))
+		{
+			_freeX86reg(i);
+		}
+	}
+
+	if (flushtype & FLUSH_ALL_X86)
+		_flushX86regs();
+
+	if (flushtype & FLUSH_CONSTANT_REGS)
+		_psxFlushConstRegs();
+
+	if ((flushtype & FLUSH_PC) /*&& !g_cpuFlushedPC*/)
+	{
+		oakAsm->MOV(OAK_WSCRATCH, psxpc);
+		oakStore32(OAK_WSCRATCH, IOP_CPU(psxRegs.pc));
+		//g_cpuFlushedPC = true;
+	}
+}
+
+void _psxFlushAllDirty()
+{
+	// TODO: Combine flushes
+	for (u32 i = 0; i < 32; ++i)
+	{
+		if (PSX_IS_CONST1(i))
+			_psxFlushConstReg(i);
+	}
+
+	_flushX86regs();
+}
+
+void psxSaveBranchState()
+{
+	s_savenBlockCycles = s_psxBlockCycles;
+	memcpy(s_saveConstRegs, g_psxConstRegs, sizeof(g_psxConstRegs));
+	s_saveHasConstReg = g_psxHasConstReg;
+	s_saveFlushedConstReg = g_psxFlushedConstReg;
+	s_psaveInstInfo = g_pCurInstInfo;
+
+	// save all regs
+	memcpy(s_saveX86regs, x86regs, sizeof(x86regs));
+}
+
+void psxLoadBranchState()
+{
+	s_psxBlockCycles = s_savenBlockCycles;
+
+	memcpy(g_psxConstRegs, s_saveConstRegs, sizeof(g_psxConstRegs));
+	g_psxHasConstReg = s_saveHasConstReg;
+	g_psxFlushedConstReg = s_saveFlushedConstReg;
+	g_pCurInstInfo = s_psaveInstInfo;
+
+	// restore all regs
+	memcpy(x86regs, s_saveX86regs, sizeof(x86regs));
+}
+
+////////////////////
+// Code Templates //
+////////////////////
+
+void _psxOnWriteReg(int reg)
+{
+	PSX_DEL_CONST(reg);
+}
+
+bool psxTrySwapDelaySlot(u32 rs, u32 rt, u32 rd)
+{
+#if 1
+	if (s_recompilingDelaySlot)
+		return false;
+
+	const u32 opcode_encoded = iopMemRead32(psxpc);
+	if (opcode_encoded == 0)
+	{
+		psxRecompileNextInstruction(true, true);
+		return true;
+	}
+
+	const u32 opcode_rs = ((opcode_encoded >> 21) & 0x1F);
+	const u32 opcode_rt = ((opcode_encoded >> 16) & 0x1F);
+	const u32 opcode_rd = ((opcode_encoded >> 11) & 0x1F);
+
+	switch (opcode_encoded >> 26)
+	{
+		case 8: // ADDI
+		case 9: // ADDIU
+		case 10: // SLTI
+		case 11: // SLTIU
+		case 12: // ANDIU
+		case 13: // ORI
+		case 14: // XORI
+		case 15: // LUI
+		case 32: // LB
+		case 33: // LH
+		case 34: // LWL
+		case 35: // LW
+		case 36: // LBU
+		case 37: // LHU
+		case 38: // LWR
+		case 39: // LWU
+		case 40: // SB
+		case 41: // SH
+		case 42: // SWL
+		case 43: // SW
+		case 46: // SWR
+		{
+			if ((rs != 0 && rs == opcode_rt) || (rt != 0 && rt == opcode_rt) || (rd != 0 && (rd == opcode_rs || rd == opcode_rt)))
+				goto is_unsafe;
+		}
+		break;
+
+		case 50: // LWC2
+		case 58: // SWC2
+			break;
+
+		case 0: // SPECIAL
+		{
+			switch (opcode_encoded & 0x3F)
+			{
+				case 0: // SLL
+				case 2: // SRL
+				case 3: // SRA
+				case 4: // SLLV
+				case 6: // SRLV
+				case 7: // SRAV
+				case 32: // ADD
+				case 33: // ADDU
+				case 34: // SUB
+				case 35: // SUBU
+				case 36: // AND
+				case 37: // OR
+				case 38: // XOR
+				case 39: // NOR
+				case 42: // SLT
+				case 43: // SLTU
+				{
+					if ((rs != 0 && rs == opcode_rd) || (rt != 0 && rt == opcode_rd) || (rd != 0 && (rd == opcode_rs || rd == opcode_rt)))
+						goto is_unsafe;
+				}
+				break;
+
+				case 15: // SYNC
+				case 24: // MULT
+				case 25: // MULTU
+				case 26: // DIV
+				case 27: // DIVU
+					break;
+
+				default:
+					goto is_unsafe;
+			}
+		}
+		break;
+
+		case 16: // COP0
+		case 17: // COP1
+		case 18: // COP2
+		case 19: // COP3
+		{
+			switch ((opcode_encoded >> 21) & 0x1F)
+			{
+				case 0: // MFC0
+				case 2: // CFC0
+				{
+					if ((rs != 0 && rs == opcode_rt) || (rt != 0 && rt == opcode_rt) || (rd != 0 && rd == opcode_rt))
+						goto is_unsafe;
+				}
+				break;
+
+				case 4: // MTC0
+				case 6: // CTC0
+					break;
+
+				default:
+				{
+					// swap when it's GTE
+					if ((opcode_encoded >> 26) != 18)
+						goto is_unsafe;
+				}
+				break;
+			}
+			break;
+		}
+		break;
+
+		default:
+			goto is_unsafe;
+	}
+
+	psxRecompileNextInstruction(true, true);
+	return true;
+
+is_unsafe:
+	return false;
+#else
+	return false;
+#endif
+}
+
+int psxTryRenameReg(int to, int from, int fromx86, int other, int xmminfo)
+{
+	// can't rename when in form Rd = Rs op Rt and Rd == Rs or Rd == Rt
+	if ((xmminfo & XMMINFO_NORENAME) || fromx86 < 0 || to == from || to == other || !EEINST_RENAMETEST(from))
+		return -1;
+
+
+	// flush back when it's been modified
+	if (x86regs[fromx86].mode & MODE_WRITE && EEINST_LIVETEST(from))
+		_writebackX86Reg(fromx86);
+
+	// remove all references to renamed-to register
+	_deletePSXtoX86reg(to, DELETE_REG_FREE_NO_WRITEBACK);
+	PSX_DEL_CONST(to);
+
+	// and do the actual rename, new register has been modified.
+	x86regs[fromx86].reg = to;
+	x86regs[fromx86].mode |= MODE_READ | MODE_WRITE;
+	return fromx86;
+}
+
+// rd = rs op rt
+void psxRecompileCodeConst0(R3000AFNPTR constcode, R3000AFNPTR_INFO constscode, R3000AFNPTR_INFO consttcode, R3000AFNPTR_INFO noconstcode, int xmminfo)
+{
+	if (!_Rd_)
+		return;
+
+	if (PSX_IS_CONST2(_Rs_, _Rt_))
+	{
+		_deletePSXtoX86reg(_Rd_, DELETE_REG_FREE_NO_WRITEBACK);
+		PSX_SET_CONST(_Rd_);
+		constcode();
+		return;
+	}
+
+	// we have to put these up here, because the register allocator below will wipe out const flags
+	// for the destination register when/if it switches it to write mode.
+	const bool s_is_const = PSX_IS_CONST1(_Rs_);
+	const bool t_is_const = PSX_IS_CONST1(_Rt_);
+	const bool d_is_const = PSX_IS_CONST1(_Rd_);
+	const bool s_is_used = EEINST_USEDTEST(_Rs_);
+	const bool t_is_used = EEINST_USEDTEST(_Rt_);
+
+	if (!s_is_const)
+		_addNeededGPRtoX86reg(_Rs_);
+	if (!t_is_const)
+		_addNeededGPRtoX86reg(_Rt_);
+	if (!d_is_const)
+		_addNeededGPRtoX86reg(_Rd_);
+
+	u32 info = 0;
+	int regs = _checkX86reg(X86TYPE_PSX, _Rs_, MODE_READ);
+	if (regs < 0 && ((!s_is_const && s_is_used) || _Rs_ == _Rd_))
+		regs = _allocX86reg(X86TYPE_PSX, _Rs_, MODE_READ);
+	if (regs >= 0)
+		info |= PROCESS_EE_SET_S(regs);
+
+	int regt = _checkX86reg(X86TYPE_PSX, _Rt_, MODE_READ);
+	if (regt < 0 && ((!t_is_const && t_is_used) || _Rt_ == _Rd_))
+		regt = _allocX86reg(X86TYPE_PSX, _Rt_, MODE_READ);
+	if (regt >= 0)
+		info |= PROCESS_EE_SET_T(regt);
+
+	// If S is no longer live, swap D for S. Saves the move.
+	int regd = psxTryRenameReg(_Rd_, _Rs_, regs, _Rt_, xmminfo);
+	if (regd < 0)
+	{
+		// TODO: If not live, write direct to memory.
+		regd = _allocX86reg(X86TYPE_PSX, _Rd_, MODE_WRITE);
+	}
+	if (regd >= 0)
+		info |= PROCESS_EE_SET_D(regd);
+
+	_validateRegs();
+
+	if (s_is_const && regs < 0)
+	{
+		// This *must* go inside the if, because of when _Rs_ =  _Rd_
+		PSX_DEL_CONST(_Rd_);
+		constscode(info /*| PROCESS_CONSTS*/);
+		return;
+	}
+
+	if (t_is_const && regt < 0)
+	{
+		PSX_DEL_CONST(_Rd_);
+		consttcode(info /*| PROCESS_CONSTT*/);
+		return;
+	}
+
+	PSX_DEL_CONST(_Rd_);
+	noconstcode(info);
+}
+
+static void psxRecompileIrxImport()
+{
+	u32 import_table = irxImportTableAddr(psxpc - 4);
+	u16 index = psxRegs.code & 0xffff;
+	if (!import_table)
+		return;
+
+	const std::string libname = iopMemReadString(import_table + 12, 8);
+
+	irxHLE hle = irxImportHLE(libname, index);
+#ifdef PCSX2_DEVBUILD
+	const irxDEBUG debug = irxImportDebug(libname, index);
+#else
+	const irxDEBUG debug = 0;
+#endif
+
+	if (!hle && !debug)
+		return;
+
+	oakAsm->MOV(OAK_WSCRATCH, psxRegs.code);
+	oakStore32(OAK_WSCRATCH, IOP_CPU(psxRegs.code));
+	oakAsm->MOV(OAK_WSCRATCH, psxpc);
+	oakStore32(OAK_WSCRATCH, IOP_CPU(psxRegs.pc));
+	_psxFlushCall(FLUSH_NODESTROY);
+
+	if (debug)
+		oakEmitCall(reinterpret_cast<const void*>(debug));
+
+	if (hle)
+	{
+		oakEmitCall(reinterpret_cast<const void*>(hle));
+		oakEmitCbnz(OAK_EAX, iopDispatcherReg);
+	}
+}
+
+// rt = rs op imm16
+void psxRecompileCodeConst1(R3000AFNPTR constcode, R3000AFNPTR_INFO noconstcode, int xmminfo)
+{
+	if (!_Rt_)
+	{
+		// check for iop module import table magic
+		if (psxRegs.code >> 16 == 0x2400)
+			psxRecompileIrxImport();
+		return;
+	}
+
+	if (PSX_IS_CONST1(_Rs_))
+	{
+		_deletePSXtoX86reg(_Rt_, DELETE_REG_FREE_NO_WRITEBACK);
+		PSX_SET_CONST(_Rt_);
+		constcode();
+		return;
+	}
+
+	_addNeededPSXtoX86reg(_Rs_);
+	_addNeededPSXtoX86reg(_Rt_);
+
+	u32 info = 0;
+
+	const bool s_is_used = EEINST_USEDTEST(_Rs_);
+	const int regs = s_is_used ? _allocX86reg(X86TYPE_PSX, _Rs_, MODE_READ) : _checkX86reg(X86TYPE_PSX, _Rs_, MODE_READ);
+	if (regs >= 0)
+		info |= PROCESS_EE_SET_S(regs);
+
+	int regt = psxTryRenameReg(_Rt_, _Rs_, regs, 0, xmminfo);
+	if (regt < 0)
+	{
+		regt = _allocX86reg(X86TYPE_PSX, _Rt_, MODE_WRITE);
+	}
+	if (regt >= 0)
+		info |= PROCESS_EE_SET_T(regt);
+
+	_validateRegs();
+
+	PSX_DEL_CONST(_Rt_);
+	noconstcode(info);
+}
+
+// rd = rt op sa
+void psxRecompileCodeConst2(R3000AFNPTR constcode, R3000AFNPTR_INFO noconstcode, int xmminfo)
+{
+	if (!_Rd_)
+		return;
+
+	if (PSX_IS_CONST1(_Rt_))
+	{
+		_deletePSXtoX86reg(_Rd_, DELETE_REG_FREE_NO_WRITEBACK);
+		PSX_SET_CONST(_Rd_);
+		constcode();
+		return;
+	}
+
+	_addNeededPSXtoX86reg(_Rt_);
+	_addNeededPSXtoX86reg(_Rd_);
+
+	u32 info = 0;
+	const bool s_is_used = EEINST_USEDTEST(_Rt_);
+	const int regt = s_is_used ? _allocX86reg(X86TYPE_PSX, _Rt_, MODE_READ) : _checkX86reg(X86TYPE_PSX, _Rt_, MODE_READ);
+	if (regt >= 0)
+		info |= PROCESS_EE_SET_T(regt);
+
+	int regd = psxTryRenameReg(_Rd_, _Rt_, regt, 0, xmminfo);
+	if (regd < 0)
+	{
+		regd = _allocX86reg(X86TYPE_PSX, _Rd_, MODE_WRITE);
+	}
+	if (regd >= 0)
+		info |= PROCESS_EE_SET_D(regd);
+
+	_validateRegs();
+
+	PSX_DEL_CONST(_Rd_);
+	noconstcode(info);
+}
+
+// rd = rt MULT rs  (SPECIAL)
+void psxRecompileCodeConst3(R3000AFNPTR constcode, R3000AFNPTR_INFO constscode, R3000AFNPTR_INFO consttcode, R3000AFNPTR_INFO noconstcode, int LOHI)
+{
+	if (PSX_IS_CONST2(_Rs_, _Rt_))
+	{
+		if (LOHI)
+		{
+			_deletePSXtoX86reg(PSX_LO, DELETE_REG_FREE_NO_WRITEBACK);
+			_deletePSXtoX86reg(PSX_HI, DELETE_REG_FREE_NO_WRITEBACK);
+		}
+
+		constcode();
+		return;
+	}
+
+	// we have to put these up here, because the register allocator below will wipe out const flags
+	// for the destination register when/if it switches it to write mode.
+	const bool s_is_const = PSX_IS_CONST1(_Rs_);
+	const bool t_is_const = PSX_IS_CONST1(_Rt_);
+	const bool s_is_used = EEINST_USEDTEST(_Rs_);
+	const bool t_is_used = EEINST_USEDTEST(_Rt_);
+
+	if (!s_is_const)
+		_addNeededGPRtoX86reg(_Rs_);
+	if (!t_is_const)
+		_addNeededGPRtoX86reg(_Rt_);
+	if (LOHI)
+	{
+		if (EEINST_LIVETEST(PSX_LO))
+			_addNeededPSXtoX86reg(PSX_LO);
+		if (EEINST_LIVETEST(PSX_HI))
+			_addNeededPSXtoX86reg(PSX_HI);
+	}
+
+	u32 info = 0;
+	int regs = _checkX86reg(X86TYPE_PSX, _Rs_, MODE_READ);
+	if (regs < 0 && !s_is_const && s_is_used)
+		regs = _allocX86reg(X86TYPE_PSX, _Rs_, MODE_READ);
+	if (regs >= 0)
+		info |= PROCESS_EE_SET_S(regs);
+
+	// need at least one in a register
+	int regt = _checkX86reg(X86TYPE_PSX, _Rt_, MODE_READ);
+	if (regs < 0 || (regt < 0 && !t_is_const && t_is_used))
+		regt = _allocX86reg(X86TYPE_PSX, _Rt_, MODE_READ);
+	if (regt >= 0)
+		info |= PROCESS_EE_SET_T(regt);
+
+	if (LOHI)
+	{
+		// going to destroy lo/hi, so invalidate if we're writing it back to state
+		const bool lo_is_used = EEINST_USEDTEST(PSX_LO);
+		const int reglo = lo_is_used ? _allocX86reg(X86TYPE_PSX, PSX_LO, MODE_WRITE) : -1;
+		if (reglo >= 0)
+			info |= PROCESS_EE_SET_LO(reglo) | PROCESS_EE_LO;
+		else
+			_deletePSXtoX86reg(PSX_LO, DELETE_REG_FREE_NO_WRITEBACK);
+
+		const bool hi_is_live = EEINST_USEDTEST(PSX_HI);
+		const int reghi = hi_is_live ? _allocX86reg(X86TYPE_PSX, PSX_HI, MODE_WRITE) : -1;
+		if (reghi >= 0)
+			info |= PROCESS_EE_SET_HI(reghi) | PROCESS_EE_HI;
+		else
+			_deletePSXtoX86reg(PSX_HI, DELETE_REG_FREE_NO_WRITEBACK);
+	}
+
+	_validateRegs();
+
+	if (s_is_const && regs < 0)
+	{
+		// This *must* go inside the if, because of when _Rs_ =  _Rd_
+		constscode(info /*| PROCESS_CONSTS*/);
+		return;
+	}
+
+	if (t_is_const && regt < 0)
+	{
+		consttcode(info /*| PROCESS_CONSTT*/);
+		return;
+	}
+
+	noconstcode(info);
+}
+
+static u8* m_recBlockAlloc = NULL;
+
+static const uint m_recBlockAllocSize =
+	(((Ps2MemSize::TotalIopRam + Ps2MemSize::Rom + Ps2MemSize::Rom1 + Ps2MemSize::Rom2) / 4) * sizeof(BASEBLOCK));
+
+static void recReserve()
+{
+	recPtr = SysMemory::GetIOPRec();
+	recPtrEnd = SysMemory::GetIOPRecEnd() - _64kb;
+
+	// Goal: Allocate BASEBLOCKs for every possible branch target in IOP memory.
+	// Any 4-byte aligned address makes a valid branch target as per MIPS design (all instructions are
+	// always 4 bytes long).
+
+	if (!m_recBlockAlloc)
+	{
+		// We're on 64-bit, if these memory allocations fail, we're in real trouble.
+		m_recBlockAlloc = (u8*)_aligned_malloc(m_recBlockAllocSize, 4096);
+		if (!m_recBlockAlloc)
+			pxFailRel("Failed to allocate R3000A BASEBLOCK lookup tables");
+	}
+
+	u8* curpos = m_recBlockAlloc;
+	recRAM = (BASEBLOCK*)curpos;
+	curpos += (Ps2MemSize::TotalIopRam / 4) * sizeof(BASEBLOCK);
+	recROM = (BASEBLOCK*)curpos;
+	curpos += (Ps2MemSize::Rom / 4) * sizeof(BASEBLOCK);
+	recROM1 = (BASEBLOCK*)curpos;
+	curpos += (Ps2MemSize::Rom1 / 4) * sizeof(BASEBLOCK);
+	recROM2 = (BASEBLOCK*)curpos;
+	curpos += (Ps2MemSize::Rom2 / 4) * sizeof(BASEBLOCK);
+
+	pxAssertRel(!s_pInstCache, "InstCache not allocated");
+	s_nInstCacheSize = 128;
+	s_pInstCache = (EEINST*)malloc(sizeof(EEINST) * s_nInstCacheSize);
+	if (!s_pInstCache)
+		pxFailRel("Failed to allocate R3000 InstCache array.");
+}
+
+void recResetIOP()
+{
+	u8* const old_high_water = recPtr;
+	u8* const cache_start = SysMemory::GetIOPRec();
+	const u64 discarded_host_bytes = (old_high_water && old_high_water > cache_start) ?
+		static_cast<u64>(old_high_water - cache_start) : 0;
+	JitProfiler::RecordCodeCacheReset(1, discarded_host_bytes);
+	oakSetAsmPtr(SysMemory::GetIOPRec(), _4kb);
+	oakStartBlock();
+
+	_DynGen_Dispatchers();
+
+	recPtr = oakEndBlock();
+	SysMemory::DiscardCodeCachePages(recPtr, old_high_water);
+
+	iopClearRecLUT((BASEBLOCK*)m_recBlockAlloc,
+		(((Ps2MemSize::TotalIopRam + Ps2MemSize::Rom + Ps2MemSize::Rom1 + Ps2MemSize::Rom2) / 4)));
+
+	// Unmapped pages must stay null so iopRecPageIsMapped() and the dispatcher
+	// CBNZ guard route them to iopJITCompile. Do NOT use recLUT_SetPage() with a
+	// null base here: it computes &base[(0-page)<<14], which is non-zero garbage
+	// (e.g. 0xFFFFFFFFC0000000) that passes the !=0 check and faults on the
+	// indexed LDR/BR below (Vitals: recExecuteBlock jumping to 0x4000018).
+	for (int i = 0; i < 0x10000; i++)
+	{
+		psxRecLUT[i] = 0;
+		psxhwLUT[i] = 0;
+	}
+
+	// IOP knows 64k pages, hence for the 0x10000's
+
+	// The bottom 2 bits of PC are always zero, so we <<14 to "compress"
+	// the pc indexer into it's lower common denominator.
+
+	// Reserve all System 256 IOP RAM pages. Standard PS2 machines still mirror
+	// their 2 MiB RAM through the larger window via the runtime page mask.
+	const u32 ram_page_mask = (Ps2MemSize::ExposedIopRam / _64kb) - 1;
+
+	for (int i = 0; i < 0x80; i++)
+	{
+		recLUT_SetPage(psxRecLUT, psxhwLUT, recRAM, 0x0000, i, i & ram_page_mask);
+		recLUT_SetPage(psxRecLUT, psxhwLUT, recRAM, 0x8000, i, i & ram_page_mask);
+		recLUT_SetPage(psxRecLUT, psxhwLUT, recRAM, 0xa000, i, i & ram_page_mask);
+	}
+
+	for (int i = 0x1fc0; i < 0x2000; i++)
+	{
+		recLUT_SetPage(psxRecLUT, psxhwLUT, recROM, 0x0000, i, i - 0x1fc0);
+		recLUT_SetPage(psxRecLUT, psxhwLUT, recROM, 0x8000, i, i - 0x1fc0);
+		recLUT_SetPage(psxRecLUT, psxhwLUT, recROM, 0xa000, i, i - 0x1fc0);
+	}
+
+	for (int i = 0x1e00; i < 0x1e40; i++)
+	{
+		recLUT_SetPage(psxRecLUT, psxhwLUT, recROM1, 0x0000, i, i - 0x1e00);
+		recLUT_SetPage(psxRecLUT, psxhwLUT, recROM1, 0x8000, i, i - 0x1e00);
+		recLUT_SetPage(psxRecLUT, psxhwLUT, recROM1, 0xa000, i, i - 0x1e00);
+	}
+
+	for (int i = 0x1e40; i < 0x1e48; i++)
+	{
+		recLUT_SetPage(psxRecLUT, psxhwLUT, recROM2, 0x0000, i, i - 0x1e40);
+		recLUT_SetPage(psxRecLUT, psxhwLUT, recROM2, 0x8000, i, i - 0x1e40);
+		recLUT_SetPage(psxRecLUT, psxhwLUT, recROM2, 0xa000, i, i - 0x1e40);
+	}
+
+	if (s_pInstCache)
+		memset(s_pInstCache, 0, sizeof(EEINST) * s_nInstCacheSize);
+
+	recBlocks.Reset();
+	g_psxMaxRecMem = 0;
+
+	psxbranch = 0;
+}
+
+static void recShutdown()
+{
+	safe_aligned_free(m_recBlockAlloc);
+
+	safe_free(s_pInstCache);
+	s_nInstCacheSize = 0;
+
+	recPtr = nullptr;
+	recPtrEnd = nullptr;
+}
+
+static void iopClearRecLUT(BASEBLOCK* base, int count)
+{
+	for (int i = 0; i < count; i++)
+		base[i].SetFnptr((uptr)iopJITCompile);
+}
+
+static __noinline s32 recExecuteBlock(s32 eeCycles)
+{
+	psxRegs.iopBreak = 0;
+	psxRegs.iopCycleEE = eeCycles;
+
+#ifdef PCSX2_DEVBUILD
+	//if (SysTrace.SIF.IsActive())
+	//	SysTrace.IOP.R3000A.Write("Switching to IOP CPU for %d cycles", eeCycles);
+#endif
+
+	// [TODO] recExecuteBlock could be replaced by a direct call to the iopEnterRecompiledCode()
+	//   (by assigning its address to the psxRec structure).  But for that to happen, we need
+	//   to move iopBreak/iopCycleEE update code to emitted assembly code. >_<  --air
+
+	// Likely Disasm, as borrowed from MSVC:
+
+	// Entry:
+	// 	mov         eax,dword ptr [esp+4]
+	// 	mov         dword ptr [iopBreak (0E88DCCh)],0
+	// 	mov         dword ptr [iopCycleEE (832A84h)],eax
+
+	// Exit:
+	// 	mov         ecx,dword ptr [iopBreak (0E88DCCh)]
+	// 	mov         edx,dword ptr [iopCycleEE (832A84h)]
+	// 	lea         eax,[edx+ecx]
+
+	((void(*)())iopEnterRecompiledCode)();
+
+	return psxRegs.iopBreak + psxRegs.iopCycleEE;
+}
+
+// Returns the offset to the next instruction after any cleared memory
+static __fi u32 psxRecClearMem(u32 pc)
+{
+	BASEBLOCK* pblock;
+
+	if (!iopRecPageIsMapped(pc))
+		return 4;
+
+	pblock = PSX_GETBLOCK(pc);
+	// if ((u8*)iopJITCompile == pblock->GetFnptr())
+	if (pblock->GetFnptr() == (uptr)iopJITCompile)
+		return 4;
+
+	pc = HWADDR(pc);
+
+	u32 lowerextent = pc, upperextent = pc + 4;
+	int blockidx = recBlocks.Index(pc);
+	pxAssert(blockidx != -1);
+
+	while (BASEBLOCKEX* pexblock = recBlocks[blockidx - 1])
+	{
+		if (pexblock->startpc + pexblock->size * 4 <= lowerextent)
+			break;
+
+		lowerextent = std::min(lowerextent, pexblock->startpc);
+		blockidx--;
+	}
+
+	int toRemoveFirst = blockidx;
+
+	while (BASEBLOCKEX* pexblock = recBlocks[blockidx])
+	{
+		if (pexblock->startpc >= upperextent)
+			break;
+
+		lowerextent = std::min(lowerextent, pexblock->startpc);
+		upperextent = std::max(upperextent, pexblock->startpc + pexblock->size * 4);
+
+		blockidx++;
+	}
+
+	if (toRemoveFirst != blockidx)
+	{
+		recBlocks.Remove(toRemoveFirst, (blockidx - 1));
+	}
+
+	iopClearRecLUT(PSX_GETBLOCK(lowerextent), (upperextent - lowerextent) / 4);
+
+	return upperextent - pc;
+}
+
+static __fi void recClearIOP(u32 Addr, u32 Size)
+{
+	u32 pc = Addr;
+	while (pc < Addr + (Size << 2)) // Size * 4
+		pc += PSXREC_CLEARM(pc);
+}
+
+void psxSetBranchReg(u32 reg)
+{
+	psxbranch = 1;
+
+	if (reg != 0xffffffff)
+	{
+		const bool swap = psxTrySwapDelaySlot(reg, 0, 0);
+
+		if (!swap)
+		{
+			const int wbreg = _allocX86reg(X86TYPE_PCWRITEBACK, 0, MODE_WRITE | MODE_CALLEESAVED);
+			const oak::WReg reg32 = oakWRegister(wbreg);
+
+			_psxMoveGPRtoR(reg32, reg);
+
+			psxRecompileNextInstruction(true, false);
+
+			if (x86regs[wbreg].inuse && x86regs[wbreg].type == X86TYPE_PCWRITEBACK)
+			{
+				oakStore32(reg32, IOP_CPU(psxRegs.pc));
+				x86regs[wbreg].inuse = 0;
+			}
+			else
+			{
+				oakLoad32(OAK_EAX, IOP_CPU(psxRegs.pcWriteback));
+				oakStore32(OAK_EAX, IOP_CPU(psxRegs.pc));
+			}
+		}
+		else
+		{
+			if (PSX_IS_DIRTY_CONST(reg) || _hasX86reg(X86TYPE_PSX, reg, 0))
+			{
+				const int x86reg = _allocX86reg(X86TYPE_PSX, reg, MODE_READ);
+				oakStore32(oakWRegister(x86reg), IOP_CPU(psxRegs.pc));
+			}
+			else
+			{
+				_psxMoveGPRtoM(IOP_CPU(psxRegs.pc), reg);
+			}
+		}
+	}
+
+	_psxFlushCall(FLUSH_EVERYTHING);
+	iPsxBranchTest(0xffffffff, 1);
+
+	oakEmitJmp(iopDispatcherReg);
+}
+
+void psxSetBranchImm(u32 imm)
+{
+	psxbranch = 1;
+	// Address zero is valid IOP RAM and uses the same cycle/WaitLoop tail.
+
+	// end the current block
+	oakAsm->MOV(OAK_WSCRATCH, imm);
+	oakStore32(OAK_WSCRATCH, IOP_CPU(psxRegs.pc));
+
+	_psxFlushCall(FLUSH_EVERYTHING);
+	iPsxBranchTest(imm, imm <= psxpc);
+
+	u8* link_patch = oakGetCurrentCodePointer();
+	oakAsm->NOP();
+	// Unmapped targets have no physical block address (hwLUT is 0 there), so
+	// HWADDR() would produce a garbage key that can never hit a real block.
+	// Canonicalize KUSEG aliases so branches reuse the canonical block, and
+	// jump straight to the dispatcher for truly unmapped targets (it routes
+	// via iopJITCompile to the skip path instead of faulting).
+	const u32 linkPC = iopRecCanonicalPC(imm);
+	if (linkPC != 0)
+		recBlocks.Link(HWADDR(linkPC), reinterpret_cast<s32*>(link_patch));
+	else
+		oakEmitJmpPtr(link_patch, (void*)iopDispatcherReg);
+}
+
+static __fi u32 psxScaleBlockCycles()
+{
+	return s_psxBlockCycles;
+}
+
+// AArch64 ADD/SUB immediates can only encode 12 bits, optionally shifted by 12.
+// Long IOP blocks can exceed that range, so fall back to a register operand.
+// OAK_WSCRATCH2 is safe here because all callers update OAK_EBX or OAK_WSCRATCH.
+static void iPsxAddBlockCycles(oak::WReg reg, u32 cycles)
+{
+	if (oak::AddSubImm::is_valid(cycles))
+		oakAsm->ADD(reg, reg, cycles);
+	else
+	{
+		oakAsm->MOV(OAK_WSCRATCH2, cycles);
+		oakAsm->ADD(reg, reg, OAK_WSCRATCH2);
+	}
+}
+
+static void iPsxSubBlockCyclesAndSetFlags(oak::WReg reg, u32 cycles)
+{
+	if (oak::AddSubImm::is_valid(cycles))
+		oakAsm->SUBS(reg, reg, cycles);
+	else
+	{
+		oakAsm->MOV(OAK_WSCRATCH2, cycles);
+		oakAsm->SUBS(reg, reg, OAK_WSCRATCH2);
+	}
+}
+
+static void iPsxAddEECycles_emit_oaknut(u32 blockCycles);
+
+static void iPsxAddEECycles(u32 blockCycles)
+{
+	iPsxAddEECycles_emit_oaknut(blockCycles);
+}
+
+static void iPsxAddEECycles_emit_oaknut(u32 blockCycles)
+{
+	if (!(psxHu32(HW_ICFG) & (1 << 3))) [[likely]]
+	{
+		oakLoad32(OAK_WSCRATCH, IOP_CPU(psxRegs.iopCycleEE));
+		if (blockCycles != 0xFFFFFFFF)
+			iPsxSubBlockCyclesAndSetFlags(OAK_WSCRATCH, blockCycles * 8);
+		else
+			oakAsm->SUBS(OAK_WSCRATCH, OAK_WSCRATCH, OAK_EAX);
+		oakStore32(OAK_WSCRATCH, IOP_CPU(psxRegs.iopCycleEE));
+		return;
+	}
+
+	// F = gcd(PS2CLK, PSXCLK) = 230400
+	const u32 cnum = 1280; // PS2CLK / F
+	const u32 cdenom = 147; // PSXCLK / F
+
+	if (blockCycles != 0xFFFFFFFF)
+		oakAsm->MOV(OAK_EAX, blockCycles * cnum);
+	oakLoad32(OAK_WSCRATCH2, IOP_CPU(psxRegs.iopCycleEECarry));
+	oakAsm->ADD(OAK_EAX, OAK_EAX, OAK_WSCRATCH2);
+	oakAsm->MOV(OAK_EEX, cdenom);
+	oakAsm->UDIV(OAK_ECX, OAK_EAX, OAK_EEX);
+	oakAsm->MSUB(OAK_EEX, OAK_ECX, OAK_EEX, OAK_EAX);
+	oakStore32(OAK_EEX, IOP_CPU(psxRegs.iopCycleEECarry));
+	oakLoad32(OAK_EEX, IOP_CPU(psxRegs.iopCycleEE));
+	oakAsm->SUBS(OAK_EEX, OAK_EEX, OAK_ECX);
+	oakStore32(OAK_EEX, IOP_CPU(psxRegs.iopCycleEE));
+}
+
+static void iPsxBranchTest(u32 newpc, u32 cpuBranch)
+{
+	u32 blockCycles = psxScaleBlockCycles();
+
+	if (EmuConfig.Speedhacks.WaitLoop && s_nBlockFF && newpc == s_branchTo)
+	{
+		oakLoad32(OAK_EAX, IOP_CPU(psxRegs.cycle));
+		oakAsm->MOV(OAK_ECX, OAK_EAX);
+		oakLoad32(OAK_EDX, IOP_CPU(psxRegs.iopCycleEE));
+		oakAsm->ADD(OAK_EDX, OAK_EDX, 7);
+		oakAsm->ASR(OAK_EDX, OAK_EDX, 3);
+		oakAsm->ADD(OAK_EAX, OAK_EAX, OAK_EDX);
+		oakLoad32(OAK_EEX, IOP_CPU(psxRegs.iopNextEventCycle));
+		oakAsm->CMP(OAK_EAX, OAK_EEX);
+		oakAsm->CSEL(OAK_EAX, OAK_EEX, OAK_EAX, oak::Cond::HI);
+		oakStore32(OAK_EAX, IOP_CPU(psxRegs.cycle));
+		oakAsm->SUB(OAK_EAX, OAK_EAX, OAK_ECX);
+		oakAsm->LSL(OAK_EAX, OAK_EAX, 3);
+		iPsxAddEECycles(0xFFFFFFFF);
+		oakEmitCondBranch(oak::Cond::LE, iopExitRecompiledCode);
+
+		oakEmitCall(reinterpret_cast<const void*>(iopEventTest));
+
+		if (newpc != 0xffffffff)
+		{
+			oakLoad32(OAK_WSCRATCH, IOP_CPU(psxRegs.pc));
+			oakAsm->MOV(OAK_WSCRATCH2, newpc);
+			oakAsm->CMP(OAK_WSCRATCH, OAK_WSCRATCH2);
+			oakEmitCondBranch(oak::Cond::NE, iopDispatcherReg);
+		}
+	}
+	else
+	{
+		oakLoad32(OAK_EBX, IOP_CPU(psxRegs.cycle));
+		iPsxAddBlockCycles(OAK_EBX, blockCycles);
+		oakStore32(OAK_EBX, IOP_CPU(psxRegs.cycle));
+
+		// jump if iopCycleEE <= 0  (iop's timeslice timed out, so time to return control to the EE)
+		iPsxAddEECycles(blockCycles);
+		oakEmitCondBranch(oak::Cond::LE, iopExitRecompiledCode);
+
+		// check if an event is pending
+		oakLoad32(OAK_EEX, IOP_CPU(psxRegs.iopNextEventCycle));
+		oakAsm->SUBS(OAK_EBX, OAK_EBX, OAK_EEX);
+		oak::Label nointerruptpending;
+		oakAsm->B(oak::Cond::MI, nointerruptpending);
+
+		oakEmitCall(reinterpret_cast<void*>(iopEventTest));
+
+		if (newpc != 0xffffffff)
+		{
+			oakLoad32(OAK_WSCRATCH, IOP_CPU(psxRegs.pc));
+			oakAsm->MOV(OAK_WSCRATCH2, newpc);
+			oakAsm->CMP(OAK_WSCRATCH, OAK_WSCRATCH2);
+			oakEmitCondBranch(oak::Cond::NE, iopDispatcherReg);
+		}
+
+		oakAsm->l(nointerruptpending);
+	}
+}
+
+static void rpsxSYSCALL_emit_oaknut();
+static void rpsxBREAK_emit_oaknut();
+
+void rpsxSYSCALL()
+{
+	rpsxSYSCALL_emit_oaknut();
+}
+
+static void rpsxSYSCALL_emit_oaknut()
+{
+	const u32 exception_pc = psxpc - 4;
+	const u32 block_cycles = psxScaleBlockCycles();
+
+	recBeginOaknutEmit();
+	oakAsm->MOV(OAK_WSCRATCH, psxRegs.code);
+	oakStore32(OAK_WSCRATCH, {oak::util::X27, static_cast<s64>(offsetof(cpuRegistersPack, psxRegs.code))});
+	oakAsm->MOV(OAK_WSCRATCH, exception_pc);
+	oakStore32(OAK_WSCRATCH, {oak::util::X27, static_cast<s64>(offsetof(cpuRegistersPack, psxRegs.pc))});
+	recEndOaknutEmit();
+
+	_psxFlushCall(FLUSH_NODESTROY);
+
+	recBeginOaknutEmit();
+	oak::Label skip_cycle_update;
+	oakAsm->MOV(OAK_WARG1, 0x20);
+	oakAsm->MOV(OAK_WARG2, psxbranch == 1);
+	oakEmitCall(reinterpret_cast<const void*>(psxException));
+	oakLoad32(OAK_WSCRATCH, {oak::util::X27, static_cast<s64>(offsetof(cpuRegistersPack, psxRegs.pc))});
+	oakAsm->MOV(OAK_WSCRATCH2, exception_pc);
+	oakAsm->CMP(OAK_WSCRATCH, OAK_WSCRATCH2);
+	oakAsm->B(oak::Cond::EQ, skip_cycle_update);
+	oakLoad32(OAK_WSCRATCH, {oak::util::X27, static_cast<s64>(offsetof(cpuRegistersPack, psxRegs.cycle))});
+	iPsxAddBlockCycles(OAK_WSCRATCH, block_cycles);
+	oakStore32(OAK_WSCRATCH, {oak::util::X27, static_cast<s64>(offsetof(cpuRegistersPack, psxRegs.cycle))});
+	iPsxAddEECycles_emit_oaknut(block_cycles);
+	oakEmitJmp(iopDispatcherReg);
+	oakAsm->l(skip_cycle_update);
+	recEndOaknutEmit();
+}
+
+void rpsxBREAK()
+{
+	rpsxBREAK_emit_oaknut();
+}
+
+static void rpsxBREAK_emit_oaknut()
+{
+	const u32 exception_pc = psxpc - 4;
+	const u32 block_cycles = psxScaleBlockCycles();
+
+	recBeginOaknutEmit();
+	oakAsm->MOV(OAK_WSCRATCH, psxRegs.code);
+	oakStore32(OAK_WSCRATCH, {oak::util::X27, static_cast<s64>(offsetof(cpuRegistersPack, psxRegs.code))});
+	oakAsm->MOV(OAK_WSCRATCH, exception_pc);
+	oakStore32(OAK_WSCRATCH, {oak::util::X27, static_cast<s64>(offsetof(cpuRegistersPack, psxRegs.pc))});
+	recEndOaknutEmit();
+
+	_psxFlushCall(FLUSH_NODESTROY);
+
+	recBeginOaknutEmit();
+	oak::Label skip_cycle_update;
+	oakAsm->MOV(OAK_WARG1, 0x24);
+	oakAsm->MOV(OAK_WARG2, psxbranch == 1);
+	oakEmitCall(reinterpret_cast<const void*>(psxException));
+	oakLoad32(OAK_WSCRATCH, {oak::util::X27, static_cast<s64>(offsetof(cpuRegistersPack, psxRegs.pc))});
+	oakAsm->MOV(OAK_WSCRATCH2, exception_pc);
+	oakAsm->CMP(OAK_WSCRATCH, OAK_WSCRATCH2);
+	oakAsm->B(oak::Cond::EQ, skip_cycle_update);
+	oakLoad32(OAK_WSCRATCH, {oak::util::X27, static_cast<s64>(offsetof(cpuRegistersPack, psxRegs.cycle))});
+	iPsxAddBlockCycles(OAK_WSCRATCH, block_cycles);
+	oakStore32(OAK_WSCRATCH, {oak::util::X27, static_cast<s64>(offsetof(cpuRegistersPack, psxRegs.cycle))});
+	iPsxAddEECycles_emit_oaknut(block_cycles);
+	oakEmitJmp(iopDispatcherReg);
+	oakAsm->l(skip_cycle_update);
+	recEndOaknutEmit();
+}
+
+static bool psxDynarecCheckBreakpoint()
+{
+	u32 pc = psxRegs.pc;
+	if (CBreakPoints::CheckSkipFirst(BREAKPOINT_IOP, pc) == pc)
+		return false;
+
+	int bpFlags = psxIsBreakpointNeeded(pc);
+	bool hit = false;
+	//check breakpoint at current pc
+	if (bpFlags & 1)
+	{
+		auto cond = CBreakPoints::GetBreakPointCondition(BREAKPOINT_IOP, pc);
+		if (cond == NULL || cond->Evaluate())
+		{
+			hit = true;
+		}
+	}
+	//check breakpoint in delay slot
+	if (bpFlags & 2)
+	{
+		auto cond = CBreakPoints::GetBreakPointCondition(BREAKPOINT_IOP, pc + 4);
+		if (cond == NULL || cond->Evaluate())
+			hit = true;
+	}
+
+	if (!hit)
+		return false;
+
+	CBreakPoints::SetBreakpointTriggered(true, BREAKPOINT_IOP);
+	EeBridge::RequestPause();
+	return true;
+}
+
+static bool psxDynarecMemcheck(size_t i)
+{
+	const u32 pc = psxRegs.pc;
+	const u32 op = iopMemRead32(pc);
+	const R5900::OPCODE& opcode = R5900::GetInstruction(op);
+	auto mc = CBreakPoints::GetMemChecks(BREAKPOINT_IOP)[i];
+
+	if (CBreakPoints::CheckSkipFirst(BREAKPOINT_IOP, pc) == pc)
+		return false;
+
+	if (mc.hasCond)
+	{
+		if (!mc.cond.Evaluate())
+			return false;
+	}
+
+	CBreakPoints::SetBreakpointTriggered(true, BREAKPOINT_IOP);
+	EeBridge::RequestPause();
+	return true;
+}
+
+static void psxRecMemcheck(u32 op, u32 bits, bool store)
+{
+	_psxFlushCall(FLUSH_EVERYTHING | FLUSH_PC);
+
+	// compute accessed address
+	_psxMoveGPRtoR(OAK_ECX, (op >> 21) & 0x1F);
+	const s32 offset = static_cast<s16>(op);
+	if (offset > 0)
+		oakAsm->ADD(OAK_ECX, OAK_ECX, static_cast<u32>(offset));
+	else if (offset < 0)
+		oakAsm->SUB(OAK_ECX, OAK_ECX, static_cast<u32>(-offset));
+
+	oakAsm->MOV(OAK_EDX, OAK_ECX);
+	oakAsm->ADD(OAK_EDX, OAK_EDX, bits >> 3);
+
+	// ecx = access address
+	// edx = access address+size
+
+	auto checks = CBreakPoints::GetMemChecks(BREAKPOINT_IOP);
+	for (size_t i = 0; i < checks.size(); i++)
+	{
+		if (checks[i].result == 0)
+			continue;
+		if ((checks[i].memCond & MEMCHECK_WRITE) == 0 && store)
+			continue;
+		if ((checks[i].memCond & MEMCHECK_READ) == 0 && !store)
+			continue;
+
+		// logic: memAddress < bpEnd && bpStart < memAddress+memSize
+
+		oakAsm->MOV(OAK_EAX, checks[i].end);
+		oakAsm->CMP(OAK_ECX, OAK_EAX);
+		oak::Label next1;
+		oakAsm->B(oak::Cond::GE, next1);
+
+		oakAsm->MOV(OAK_EAX, checks[i].start);
+		oakAsm->CMP(OAK_EAX, OAK_EDX);
+		oak::Label next2;
+		oakAsm->B(oak::Cond::GE, next2);
+
+		// hit the breakpoint
+
+		if (checks[i].result & MEMCHECK_BREAK)
+		{
+			oakAsm->MOV(OAK_WARG1, static_cast<u32>(i));
+			oakEmitCall(reinterpret_cast<const void*>(psxDynarecMemcheck));
+			oakEmitCbnz(OAK_EAX, iopExitRecompiledCode);
+		}
+
+		oakAsm->l(next1);
+		oakAsm->l(next2);
+	}
+}
+
+static void psxEncodeBreakpoint()
+{
+	if (psxIsBreakpointNeeded(psxpc) != 0)
+	{
+		_psxFlushCall(FLUSH_EVERYTHING | FLUSH_PC);
+		oakEmitCall(reinterpret_cast<void*>(psxDynarecCheckBreakpoint));
+		oakEmitCbnz(OAK_EAX, iopExitRecompiledCode);
+	}
+}
+
+static void psxEncodeMemcheck()
+{
+	int needed = psxIsMemcheckNeeded(psxpc);
+	if (needed == 0)
+		return;
+
+	u32 op = iopMemRead32(needed == 2 ? psxpc + 4 : psxpc);
+	const R5900::OPCODE& opcode = R5900::GetInstruction(op);
+
+	bool store = (opcode.flags & IS_STORE) != 0;
+	switch (opcode.flags & MEMTYPE_MASK)
+	{
+		case MEMTYPE_BYTE:
+			psxRecMemcheck(op, 8, store);
+			break;
+		case MEMTYPE_HALF:
+			psxRecMemcheck(op, 16, store);
+			break;
+		case MEMTYPE_WORD:
+			psxRecMemcheck(op, 32, store);
+			break;
+		case MEMTYPE_DWORD:
+			psxRecMemcheck(op, 64, store);
+			break;
+	}
+}
+
+// EmuCoreX: runs the instruction currently in psxRegs.code through the IOP
+// interpreter dispatch table. Called from recompiled code (see the opcode
+// family blocklist hook in psxRecompileNextInstruction).
+static void iopInterpretCurrentInstruction()
+{
+	psxBSC[psxRegs.code >> 26]();
+}
+
+void psxRecompileNextInstruction(bool delayslot, bool swapped_delayslot)
+{
+	const u32 profiler_pc = psxpc;
+	const int old_code = psxRegs.code;
+	EEINST* old_inst_info = g_pCurInstInfo;
+	s_recompilingDelaySlot = delayslot;
+
+	// add breakpoint
+	if (!delayslot)
+	{
+		// Broken on x64
+		psxEncodeBreakpoint();
+		psxEncodeMemcheck();
+	}
+	else
+	{
+		_clearNeededX86regs();
+	}
+
+	psxRegs.code = iopMemRead32(psxpc);
+	JitProfiler::OpcodeRangeScope profiler_scope;
+	if (JitProfiler::IsActive())
+		profiler_scope.Begin(1, HWADDR(profiler_pc), static_cast<u32>(psxRegs.code));
+	s_psxBlockCycles++;
+	psxpc += 4;
+
+	g_pCurInstInfo++;
+
+	g_iopCyclePenalty = 0;
+	if (OpcodeFamilies::IOPShouldInterpret(psxRegs.code))
+	{
+		// EmuCoreX: user forced this opcode (or its family) onto the IOP
+		// interpreter. psxRegs.pc was already advanced to the instruction
+		// after this one, which matches the interpreter's execI() convention,
+		// so publish both PC and opcode before interpreter dispatch. A preceding
+		// IR memory hook may have changed the runtime psxRegs.code.
+		// Branches execute their own delay slot and update psxRegs.pc, so end
+		// the block and let the dispatcher continue from the interpreter's pc.
+		_psxFlushCall(FLUSH_EVERYTHING | FLUSH_PC);
+		oakAsm->MOV(OAK_WSCRATCH, static_cast<u32>(psxRegs.code));
+		oakStore32(OAK_WSCRATCH, IOP_CPU(psxRegs.code));
+		oakEmitCall(reinterpret_cast<void*>(&iopInterpretCurrentInstruction));
+		if (!s_recompilingDelaySlot)
+			psxbranch = 2;
+	}
+	else
+	{
+		rpsxBSC[psxRegs.code >> 26]();
+	}
+	s_psxBlockCycles += g_iopCyclePenalty;
+
+	if (!swapped_delayslot)
+		_clearNeededX86regs();
+
+	if (swapped_delayslot)
+	{
+		psxRegs.code = old_code;
+		g_pCurInstInfo = old_inst_info;
+	}
+
+}
+
+
+#ifdef EMUCOREX_IOP_IR_COMPILED
+// This exit only restores the temporary IR frame and falls through into the
+// same legacy block. The IOP block tail owns PC, cycles, linking and events.
+static void IopIrFallThrough(void*, u32, bool) {}
+
+static void IopIrIndirectExit(void*)
+{
+    // The shared lowerer restores its frame before handing off W16.
+    oakStore32(oak::util::W16, IOP_CPU(psxRegs.pc));
+    psxSetBranchReg(0xffffffff);
+}
+
+static void IopIrStaticExit(void*, u32 target, bool)
+{
+    psxSetBranchImm(target);
+}
+
+struct IopIrMemoryContext
+{
+    u32 start_pc;
+    const u32* code;
+    u32 count;
+    bool control;
+};
+
+static void IopIrBeforeMemory(void* opaque, u32 guest_pc, bool delay_slot)
+{
+    const auto& ctx = *static_cast<const IopIrMemoryContext*>(opaque);
+    const u32 index = (guest_pc - ctx.start_pc) / 4;
+    pxAssert(index < ctx.count && delay_slot == (ctx.control && index + 1 == ctx.count));
+    // IOP handlers observe the next PC and the original instruction. Keep
+    // W0/W1 intact: they carry the memory address and optional store value.
+    oakAsm->MOV(oak::util::W16, guest_pc + 4);
+    oakStore32(oak::util::W16, {oak::util::X27, static_cast<s64>(offsetof(cpuRegistersPack, psxRegs.pc))});
+    oakAsm->MOV(oak::util::W16, ctx.code[index]);
+    oakStore32(oak::util::W16, {oak::util::X27, static_cast<s64>(offsetof(cpuRegistersPack, psxRegs.code))});
+}
+
+static bool TryIopIrSequence()
+{
+    // Memory merges emit several SSA operations per guest instruction. Keep
+    // a fragment small enough for the outer block's remaining 32 KiB reserve.
+    std::array<u32, 16> code;
+    u32 available = 0;
+    const u32 limit = std::min<u32>(code.size(), (s_nEndBlock - psxpc) / 4);
+    for (; available < limit; ++available)
+    {
+        const u32 word = iopMemRead32(psxpc + available * 4);
+        if (OpcodeFamilies::IOPShouldInterpret(word)) break;
+        code[available] = word;
+    }
+    if (available == 0) return false;
+    ir::Function fn;
+    u32 accepted = 0;
+    bool control = false;
+    std::string error;
+    if (!IopIr::LiftSequence(code.data(), psxpc, available, fn, &accepted, &error, &control) ||
+        !Arm64Ir::CanLower(fn, true, &error, Arm64Ir::GuestState::IOP))
+        return false;
+
+    // Commit legacy state and invalidate its caches BEFORE emitting exits:
+    // their hooks flush legacy state too and must never restore stale values.
+    _psxFlushCall(FLUSH_EVERYTHING);
+    _initX86regs();
+    g_psxHasConstReg = g_psxFlushedConstReg = 1;
+    IopIrMemoryContext memory_context{psxpc, code.data(), accepted, control};
+    psxRegs.code = code[accepted - 1];
+    s_recompilingDelaySlot = false;
+    g_iopCyclePenalty = 0;
+    psxpc += accepted * 4;
+    g_pCurInstInfo += accepted;
+    s_psxBlockCycles += accepted;
+    // Exit hooks emit cycle/event tails during lowering. Account the entire
+    // source fragment first, including penalties even if results fold away.
+    for (u32 i = 0; i < accepted; ++i)
+    {
+        if ((code[i] >> 26) == 16) ++s_iopIrCop0Instructions;
+        const u32 funct = code[i] & 63;
+        if ((code[i] >> 26) == 0 && funct >= 0x18 && funct <= 0x1b)
+        {
+            s_psxBlockCycles += funct <= 0x19 ? psxInstCycles_Mult : psxInstCycles_Div;
+            ++s_iopIrMulDivInstructions;
+        }
+    }
+    Arm64Ir::LowerHooks hooks;
+    hooks.ctx = &memory_context;
+    hooks.before_memory = &IopIrBeforeMemory;
+    hooks.guest_exit = control ? &IopIrStaticExit : &IopIrFallThrough;
+    hooks.indirect_exit = &IopIrIndirectExit;
+    Arm64Ir::LowerOptions options;
+    options.guest_state = Arm64Ir::GuestState::IOP;
+    options.direct_iop_loads = IopIrDirectLoadsEnabled();
+    options.inline_division = IopIrNativeDivisionEnabled();
+    options.inline_body = true;
+    options.hooks = &hooks;
+    Arm64Ir::LowerOutput out;
+    if (!Arm64Ir::LowerBlock(fn, options, nullptr, 0, &out, &error))
+        pxFailRel(error.c_str()); // validated above; never append fallback after partial emission
+    if (control) ++s_iopIrBranches;
+    s_iopIrInstructions += accepted;
+#if defined(EMUCOREX_ENABLE_NATIVE_SELF_TESTS)
+    s_iopIrNclipFusions += out.fused_iop_nclips;
+    s_iopIrAvszFusions += out.fused_iop_avsz;
+    // Count source COP2 operations only after both LiftSequence and LowerBlock
+    // accepted the complete sequence. This isolates coverage from the legacy
+    // terminator, delay slot, and block recompilation accounting.
+    for (u32 i = 0; i < accepted; ++i)
+    {
+        const u32 word = code[i];
+        const u32 rs = (word >> 21) & 31;
+        if ((word >> 26) == 18 && (word & 63u) == 0 &&
+            (rs == 0 || rs == 2 || rs == 4 || rs == 6))
+            ++s_iopIrCop2Instructions;
+        if ((word >> 26) == 18 && rs == 16 && (word & 63u) == 6)
+        {
+            ++s_iopIrNclipCompiles;
+#if defined(__ANDROID__)
+            if ((s_iopIrNclipCompiles & (s_iopIrNclipCompiles - 1)) == 0)
+                __android_log_print(ANDROID_LOG_INFO, "IOPIR", "compiled_nclip=%llu",
+                    static_cast<unsigned long long>(s_iopIrNclipCompiles));
+#endif
+        }
+        if ((word >> 26) == 18 && rs == 16 && ((word & 63u) == 0x2d || (word & 63u) == 0x2e))
+        {
+            const bool avsz4 = (word & 63u) == 0x2e;
+            const u64 count = avsz4 ? ++s_iopIrAvsz4Compiles : ++s_iopIrAvsz3Compiles;
+#if defined(__ANDROID__)
+            if ((count & (count - 1)) == 0)
+                __android_log_print(ANDROID_LOG_INFO, "IOPIR", "compiled_avsz%u=%llu",
+                    avsz4 ? 4u : 3u, static_cast<unsigned long long>(count));
+#endif
+        }
+    }
+#endif
+    s_iopIrMemoryOperations += out.iop_memory_operations;
+    s_iopIrDirectLoads += out.direct_iop_load_operations;
+    if (out.frame_size != 0 && out.spill_values != 0) ++s_iopIrSpillSequences;
+#if defined(__ANDROID__)
+    static u64 sequences = 0, native_bytes = 0, fused_multiply_pairs = 0;
+    ++sequences;
+    native_bytes += out.host_size;
+    fused_multiply_pairs += out.fused_multiply_pairs;
+    if ((sequences <= 1024 && (sequences & (sequences - 1)) == 0) || sequences % 4096 == 0)
+        __android_log_print(ANDROID_LOG_INFO, "IOPIR",
+            "compiled_sequences=%llu guest_instructions=%llu native_bytes=%llu last_pc=%08x registers=%u spills=%u frame=%u memory_operations=%llu direct_loads=%llu native_div=%u muldiv_instructions=%llu fused_multiply_pairs=%llu control_branches=%llu cop0_instructions=%llu",
+            static_cast<unsigned long long>(sequences), static_cast<unsigned long long>(s_iopIrInstructions),
+            static_cast<unsigned long long>(native_bytes), psxpc - accepted * 4, out.register_values, out.spill_values, out.frame_size,
+            static_cast<unsigned long long>(s_iopIrMemoryOperations), static_cast<unsigned long long>(s_iopIrDirectLoads),
+            options.inline_division ? 1u : 0u, static_cast<unsigned long long>(s_iopIrMulDivInstructions), static_cast<unsigned long long>(fused_multiply_pairs), static_cast<unsigned long long>(s_iopIrBranches), static_cast<unsigned long long>(s_iopIrCop0Instructions));
+#endif
+    return true;
+}
+#endif // EMUCOREX_IOP_IR_COMPILED
+
+static void iopRecRecompile(u32 startpc)
+{
+	u32 i;
+	u32 willbranch3 = 0;
+
+	// Normalize KUSEG aliases (e.g. 0x20000000 -> 0x00000000) and survive jumps
+	// to unmapped HW/gap addresses instead of faulting on PSX_GETBLOCK.
+	if (!iopRecPageIsMapped(startpc))
+	{
+		const u32 canon = iopRecCanonicalPC(startpc);
+		if (canon != 0 && canon != startpc)
+		{
+			psxRegs.pc = canon;
+			startpc = canon;
+		}
+		else if (canon == 0)
+		{
+			iopRecSkipUnmappedPC(startpc);
+			return;
+		}
+	}
+
+	// When upgrading the IOP, there are two resets, the second of which is a 'fake' reset
+	// This second 'reset' involves UDNL calling SYSMEM and LOADCORE directly, resetting LOADCORE's modules
+	// This detects when SYSMEM is called and clears the modules then
+	if(startpc == 0x890)
+	{
+		R3000SymbolGuardian.ClearIrxModules();
+	}
+
+	// Inject IRX hack
+	if (startpc == 0x1630 && EmuConfig.CurrentIRX.length() > 3)
+	{
+		if (iopMemRead32(0x20018) == 0x1F)
+		{
+			// FIXME do I need to increase the module count (0x1F -> 0x20)
+			iopMemWrite32(0x20094, 0xbffc0000);
+		}
+	}
+
+	pxAssert(startpc);
+
+	// if recPtr reached the mem limit reset whole mem
+	if (recPtr >= recPtrEnd)
+	{
+		recResetIOP();
+		// Reset may have remapped pages; re-validate after the reset.
+		if (!iopRecPageIsMapped(startpc))
+		{
+			const u32 canon = iopRecCanonicalPC(startpc);
+			if (canon != 0 && canon != startpc)
+			{
+				psxRegs.pc = canon;
+				startpc = canon;
+			}
+			else if (canon == 0)
+			{
+				iopRecSkipUnmappedPC(startpc);
+				return;
+			}
+		}
+	}
+
+	// recPtrEnd is the reset threshold, while the remaining 64 KiB is the
+	// in-flight block reserve. Keep Oaknut inside the IOP cache reservation.
+	u8* const physical_end = SysMemory::GetIOPRecEnd();
+	pxAssert(recPtr < physical_end);
+	oakSetAsmPtr(recPtr, physical_end - recPtr);
+	recPtr = oakStartBlock();
+	JitProfiler::BlockCompileScope compile_scope(1, HWADDR(startpc));
+
+	s_pCurBlock = PSX_GETBLOCK(startpc);
+
+	pxAssert(s_pCurBlock->GetFnptr() == (uptr)iopJITCompile);
+
+	s_pCurBlockEx = recBlocks.Get(HWADDR(startpc));
+
+	if (!s_pCurBlockEx || s_pCurBlockEx->startpc != HWADDR(startpc))
+		s_pCurBlockEx = recBlocks.New(HWADDR(startpc), (uptr)recPtr);
+
+	if (HangTrace::IsActive())
+	{
+		const u32 first_code = iopMemRead32(startpc);
+		HangTrace::EmitBlockTrace(HangTrace::CPU_IOP, HWADDR(startpc), first_code);
+	}
+
+	psxbranch = 0;
+
+	s_pCurBlock->SetFnptr((uptr)oakGetCurrentCodePointer());
+	s_psxBlockCycles = 0;
+
+	// reset recomp state variables
+	psxpc = startpc;
+	g_psxHasConstReg = g_psxFlushedConstReg = 1;
+
+	_initX86regs();
+
+	if ((psxHu32(HW_ICFG) & 8) && (HWADDR(startpc) == 0xa0 || HWADDR(startpc) == 0xb0 || HWADDR(startpc) == 0xc0))
+	{
+		oakEmitCall(reinterpret_cast<void*>(psxBiosCall));
+		oakEmitCbnz(OAK_EAX, iopDispatcherReg);
+	}
+
+
+	// go until the next branch
+	i = startpc;
+	s_nEndBlock = 0xffffffff;
+	s_branchTo = -1;
+
+	while (1)
+	{
+		if (i != startpc)
+		{
+			// Stop at unmapped pages and 4K boundaries instead of faulting or
+			// building megabyte-long NOP blocks out of zeroed RAM.
+			if (!iopRecPageIsMapped(i) || (i & 0xfff) == 0)
+			{
+				// branch = 3
+				willbranch3 = 1;
+				s_nEndBlock = i;
+				break;
+			}
+			BASEBLOCK* pblock = PSX_GETBLOCK(i);
+			if (pblock->GetFnptr() != (uptr)iopJITCompile)
+			{
+				// branch = 3
+				willbranch3 = 1;
+				s_nEndBlock = i;
+				break;
+			}
+			// Hard cap: pathological straight-line code (e.g. null jumps into
+			// zeroed RAM) must not balloon InstCache or overflow the 64K block
+			// reserve.
+			if (((i - startpc) >> 2) >= 1024)
+			{
+				willbranch3 = 1;
+				s_nEndBlock = i;
+				break;
+			}
+		}
+
+		psxRegs.code = iopMemRead32(i);
+
+		switch (psxRegs.code >> 26)
+		{
+			case 0: // special
+				if (_Funct_ == 8 || _Funct_ == 9)
+				{ // JR, JALR
+					s_nEndBlock = i + 8;
+					goto StartRecomp;
+				}
+				break;
+
+			case 1: // regimm
+				if (_Rt_ == 0 || _Rt_ == 1 || _Rt_ == 16 || _Rt_ == 17)
+				{
+					s_branchTo = _Imm_ * 4 + i + 4;
+					if (s_branchTo > startpc && s_branchTo < i)
+						s_nEndBlock = s_branchTo;
+					else
+						s_nEndBlock = i + 8;
+					goto StartRecomp;
+				}
+				break;
+
+			case 2: // J
+			case 3: // JAL
+				s_branchTo = (_InstrucTarget_ << 2) | ((i + 4) & 0xf0000000);
+				s_nEndBlock = i + 8;
+				goto StartRecomp;
+
+			// branches
+			case 4:
+			case 5:
+			case 6:
+			case 7:
+				s_branchTo = _Imm_ * 4 + i + 4;
+				if (s_branchTo > startpc && s_branchTo < i)
+					s_nEndBlock = s_branchTo;
+				else
+					s_nEndBlock = i + 8;
+				goto StartRecomp;
+		}
+
+		i += 4;
+	}
+
+StartRecomp:
+
+	s_nBlockFF = false;
+	if (s_branchTo == startpc)
+	{
+		s_nBlockFF = true;
+		for (i = startpc; i < s_nEndBlock; i += 4)
+		{
+			if (i != s_nEndBlock - 8)
+			{
+				switch (iopMemRead32(i))
+				{
+					case 0: // nop
+						break;
+					default:
+						s_nBlockFF = false;
+				}
+			}
+		}
+	}
+
+	// rec info //
+	{
+		EEINST* pcur;
+
+		const u32 block_offset = (s_nEndBlock - startpc) >> 2;
+		if (s_nInstCacheSize < block_offset + 1)
+		{
+			const u32 required_size = block_offset + 1;
+			const u32 new_size = std::max(required_size, s_nInstCacheSize << 1);
+			EEINST* new_cache = (EEINST*)malloc(sizeof(EEINST) * new_size);
+			if (!new_cache)
+				pxFailRel("Failed to allocate R3000A InstCache array");
+
+			if (s_pInstCache && s_nInstCacheSize > 0)
+				memcpy(new_cache, s_pInstCache, sizeof(EEINST) * s_nInstCacheSize);
+
+			free(s_pInstCache);
+			s_pInstCache = new_cache;
+			s_nInstCacheSize = new_size;
+		}
+
+		pcur = s_pInstCache + block_offset;
+		_recClearInst(pcur);
+		pcur->info = 0;
+
+		for (i = s_nEndBlock; i > startpc; i -= 4)
+		{
+			psxRegs.code = iopMemRead32(i - 4);
+			pcur[-1] = pcur[0];
+			rpsxpropBSC(pcur - 1, pcur);
+			pcur--;
+		}
+	}
+
+	g_pCurInstInfo = s_pInstCache;
+    // Include temporary breakpoints. Debugger/profiler paths retain their
+    // instruction-by-instruction hooks; unsupported/forced delays stay legacy.
+#ifdef EMUCOREX_IOP_IR_COMPILED
+    const bool use_ir = IopIrEnabled() && !JitProfiler::IsActive() &&
+        CBreakPoints::GetBreakpoints(BREAKPOINT_IOP, true).empty() && CBreakPoints::GetNumMemchecks() == 0;
+#else
+    constexpr bool use_ir = false;
+#endif
+	while (!psxbranch && psxpc < s_nEndBlock)
+	{
+        // A page of IR memory operations can exceed the legacy 64 KiB block
+        // reserve. Split BEFORE the next fragment/instruction, leaving half
+        // the reserve for its bounded emission and the normal linking tail.
+        if (use_ir && oakGetCurrentCodePointer() - recPtr >= _32kb)
+        {
+            s_nEndBlock = psxpc;
+            willbranch3 = 1;
+            break;
+        }
+#ifdef EMUCOREX_IOP_IR_COMPILED
+        if (use_ir && TryIopIrSequence()) continue;
+#endif
+		psxRecompileNextInstruction(false, false);
+	}
+
+	pxAssert((psxpc - startpc) >> 2 <= 0xffff);
+	s_pCurBlockEx->size = (psxpc - startpc) >> 2;
+
+	if (!(psxpc & 0x10000000))
+		g_psxMaxRecMem = std::max((psxpc & ~0xa0000000), g_psxMaxRecMem);
+
+	if (psxbranch == 2)
+	{
+		_psxFlushCall(FLUSH_EVERYTHING);
+
+		iPsxBranchTest(0xffffffff, 1);
+
+		oakEmitJmp(iopDispatcherReg);
+	}
+	else
+	{
+		if (psxbranch)
+			pxAssert(!willbranch3);
+		else
+		{
+			oakLoad32(OAK_WSCRATCH, IOP_CPU(psxRegs.cycle));
+			iPsxAddBlockCycles(OAK_WSCRATCH, psxScaleBlockCycles());
+			oakStore32(OAK_WSCRATCH, IOP_CPU(psxRegs.cycle));
+			iPsxAddEECycles(psxScaleBlockCycles());
+		}
+
+		if (willbranch3 || !psxbranch)
+		{
+			pxAssert(psxpc == s_nEndBlock);
+			_psxFlushCall(FLUSH_EVERYTHING);
+			oakAsm->MOV(OAK_WSCRATCH, psxpc);
+			oakStore32(OAK_WSCRATCH, IOP_CPU(psxRegs.pc));
+			u8* link_patch = oakGetCurrentCodePointer();
+			oakAsm->NOP();
+			// s_nEndBlock can be the first unmapped address past the block
+			// (block scan stops at unmapped pages/4K boundaries). Linking it
+			// with HWADDR() would insert a garbage key; go via the dispatcher
+			// so unmapped fall-through uses the skip path.
+			const u32 linkPC = iopRecCanonicalPC(s_nEndBlock);
+			if (linkPC != 0)
+				recBlocks.Link(HWADDR(linkPC), reinterpret_cast<s32*>(link_patch));
+			else
+				oakEmitJmpPtr(link_patch, (void*)iopDispatcherReg);
+			psxbranch = 3;
+		}
+	}
+
+	pxAssert(oakGetCurrentCodePointer() < SysMemory::GetIOPRecEnd());
+
+	pxAssert(oakGetCurrentCodePointer() - recPtr < _64kb);
+	s_pCurBlockEx->x86size = oakGetCurrentCodePointer() - recPtr;
+
+	Perf::iop.RegisterPC((void*)s_pCurBlockEx->fnptr, s_pCurBlockEx->x86size, s_pCurBlockEx->startpc);
+	const u8* const compiled_host_end = oakGetCurrentCodePointer();
+	recPtr = oakEndBlock();
+	compile_scope.Finish(s_pCurBlockEx->size, s_pCurBlockEx->x86size,
+		reinterpret_cast<const void*>(s_pCurBlockEx->fnptr), compiled_host_end);
+
+	pxAssert((g_psxHasConstReg & g_psxFlushedConstReg) == g_psxHasConstReg);
+
+	s_pCurBlock = NULL;
+	s_pCurBlockEx = NULL;
+}
+
+void IOP_JitGetBlockProfiles(std::vector<JitBlockProfile>& outBlocks)
+{
+	for (u32 i = 0; i < recBlocks.GetBlockCount(); i++)
+	{
+		BASEBLOCKEX* b = recBlocks[i];
+		if (!b) continue;
+		JitBlockProfile p;
+		p.startpc = b->startpc;
+		p.size = b->size;
+		p.host_size = b->x86size;
+		p.execution_count = b->execution_count;
+		p.type = 1; // IOP
+		outBlocks.push_back(p);
+	}
+}
+
+R3000Acpu psxRec = {
+	recReserve,
+	recResetIOP,
+	recExecuteBlock,
+	recClearIOP,
+	recShutdown,
+};

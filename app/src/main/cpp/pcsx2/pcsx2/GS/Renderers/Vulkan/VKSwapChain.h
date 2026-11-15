@@ -1,0 +1,142 @@
+// SPDX-FileCopyrightText: 2002-2026 PCSX2 Dev Team
+// SPDX-License-Identifier: GPL-3.0+
+
+#pragma once
+
+#define GS_VK_PRESENT_ROTATION_PARITY 1
+
+#include "Config.h"
+#include "GS/Renderers/Vulkan/GSTextureVK.h"
+
+#include "common/WindowInfo.h"
+
+#include <array>
+#include <memory>
+#include <optional>
+#include <vector>
+
+class VKSwapChain
+{
+public:
+	// We don't actually need +1 semaphores, or, more than one really.
+	// But, the validation layer gets cranky if we don't fence wait before the next image acquire.
+	// So, add an additional semaphore to ensure that we're never acquiring before fence waiting.
+	static constexpr u32 NUM_SEMAPHORES = 4; // Should be command buffers + 1
+
+	~VKSwapChain();
+
+	// Creates a vulkan-renderable surface for the specified window handle.
+	static VkSurfaceKHR CreateVulkanSurface(VkInstance instance, VkPhysicalDevice physical_device, WindowInfo* wi);
+
+	// Destroys a previously-created surface.
+	static void DestroyVulkanSurface(VkInstance instance, WindowInfo* wi, VkSurfaceKHR surface);
+
+	// Create a new swap chain from a pre-existing surface.
+	// Takes ownership of the surface on success; the caller retains it on failure.
+	static std::unique_ptr<VKSwapChain> Create(const WindowInfo& wi, VkSurfaceKHR surface, VkPresentModeKHR present_mode,
+		std::optional<bool> exclusive_fullscreen_control);
+
+	/// Returns the Vulkan present mode for a given vsync mode that is compatible with this device.
+	static bool SelectPresentMode(VkSurfaceKHR surface, GSVSyncMode* vsync_mode, VkPresentModeKHR* present_mode);
+
+	__fi VkSurfaceKHR GetSurface() const { return m_surface; }
+	__fi VkSwapchainKHR GetSwapChain() const { return m_swap_chain; }
+	__fi const VkSwapchainKHR* GetSwapChainPtr() const { return &m_swap_chain; }
+	__fi const WindowInfo& GetWindowInfo() const { return m_window_info; }
+	__fi u32 GetWidth() const { return m_window_info.surface_width; }
+	__fi u32 GetHeight() const { return m_window_info.surface_height; }
+	__fi DisplayRotation GetPreRotation() const { return m_pre_rotation; }
+	bool HasSurfaceRotationChanged() const;
+	__fi float GetScale() const { return m_window_info.surface_scale; }
+	__fi u32 GetCurrentImageIndex() const { return m_current_image; }
+	__fi const u32* GetCurrentImageIndexPtr() const { return &m_current_image; }
+	__fi u32 GetImageCount() const { return static_cast<u32>(m_images.size()); }
+	__fi u32 GetImageWidth() const { return m_images.empty()?GetWidth():static_cast<u32>(m_images[0]->GetWidth()); }
+	__fi u32 GetImageHeight() const { return m_images.empty()?GetHeight():static_cast<u32>(m_images[0]->GetHeight()); }
+	__fi VkPresentModeKHR GetPresentMode() const { return m_present_mode; }
+	__fi GSTextureVK* GetTexture(u32 index) { return m_images[index].get(); }
+	__fi const GSTextureVK* GetCurrentTexture() const { return m_images[m_current_image].get(); }
+	__fi GSTextureVK* GetCurrentTexture() { return m_images[m_current_image].get(); }
+	__fi VkImage GetImage(u32 index) const { return m_images[index]->GetImage(); }
+	__fi VkSemaphore GetImageAvailableSemaphore() const
+	{
+		return m_semaphores[m_current_semaphore].available_semaphore;
+	}
+	__fi const VkSemaphore* GetImageAvailableSemaphorePtr() const
+	{
+		return &m_semaphores[m_current_semaphore].available_semaphore;
+	}
+	__fi VkSemaphore GetRenderingFinishedSemaphore() const
+	{
+		return m_present_semaphores[m_current_image];
+	}
+	__fi const VkSemaphore* GetRenderingFinishedSemaphorePtr() const
+	{
+		return &m_present_semaphores[m_current_image];
+	}
+
+	VkFormat GetTextureFormat() const;
+	/// Number of images that can be acquired in addition to the real frame.
+	__fi u32 GetExtraAcquirableImages() const { return m_extra_acquirable_images; }
+	VkResult AcquireNextImage();
+	// Present/acquire wall-time stats on the GS thread; see EMUCOREX_GS_PRESENT_TIMING in VKSwapChain.cpp.
+	static bool PresentTimingEnabled();
+	static u64 PresentTimingNowNs();
+	void RecordPresentTime(u64 present_ns);
+	/// GS-thread time spent queueing a present, and blocked waiting for the present thread (async mode).
+	static void RecordGsPresentCost(u64 enqueue_ns, u64 wait_ns);
+	/// Present on a dedicated thread (default on). Kill switch: debug.emucorex.async_present=0 or
+	/// EMUCOREX_GS_ASYNC_PRESENT=0.
+	static bool AsyncPresentEnabled();
+	void ReleaseCurrentImage();
+	void ResetImageAcquireResult();
+
+	bool RecreateSurface(const WindowInfo& new_wi);
+	bool ResizeSwapChain(u32 new_width = 0, u32 new_height = 0, float new_scale = 1.0f);
+
+	// Change vsync enabled state. This may fail as it causes a swapchain recreation.
+	bool SetPresentMode(VkPresentModeKHR present_mode);
+
+private:
+	VKSwapChain(const WindowInfo& wi, VkSurfaceKHR surface, VkPresentModeKHR present_mode,
+		std::optional<bool> exclusive_fullscreen_control);
+
+	static std::optional<VkSurfaceFormatKHR> SelectSurfaceFormat(VkSurfaceKHR surface);
+
+	bool CreateSwapChain();
+	void DestroySwapChain();
+	void DestroySwapChainImages();
+
+	void DestroySurface();
+
+	struct ImageSemaphores
+	{
+		VkSemaphore available_semaphore;
+	};
+
+	WindowInfo m_window_info;
+	DisplayRotation m_surface_rotation = DisplayRotation::Rot0;
+	DisplayRotation m_pre_rotation = DisplayRotation::Rot0;
+
+	VkSurfaceKHR m_surface = VK_NULL_HANDLE;
+	VkSwapchainKHR m_swap_chain = VK_NULL_HANDLE;
+
+	std::vector<std::unique_ptr<GSTextureVK>> m_images;
+	u32 m_extra_acquirable_images = 0;
+	std::array<ImageSemaphores, NUM_SEMAPHORES> m_semaphores = {};
+	// A submit fence does not cover presentation. Re-acquiring the same image and
+	// waiting on its acquire semaphore makes its previous present semaphore reusable.
+	std::vector<VkSemaphore> m_present_semaphores;
+
+	u32 m_current_image = 0;
+	u32 m_current_semaphore = 0;
+
+	VkPresentModeKHR m_present_mode = VK_PRESENT_MODE_IMMEDIATE_KHR;
+
+	std::optional<VkResult> m_image_acquire_result;
+
+	u32 m_requested_image_count = 0;
+	u64 m_pt_frames = 0, m_pt_present_sum_ns = 0, m_pt_present_max_ns = 0;
+	u64 m_pt_acquires = 0, m_pt_acquire_sum_ns = 0, m_pt_acquire_max_ns = 0;
+	std::optional<bool> m_exclusive_fullscreen_control;
+};

@@ -1,0 +1,2352 @@
+// SPDX-FileCopyrightText: 2002-2026 PCSX2 Dev Team
+// SPDX-License-Identifier: GPL-3.0+
+
+#include "GS/Renderers/Common/GSDevice.h"
+#include "GS/Renderers/Common/GSPassScheduler.h"
+#include "GS/Renderers/Common/GSPassTag.h"
+#include "GS/GSGL.h"
+#include "GS/GS.h"
+#include "GS/GSUtil.h"
+#include "platform/host/Host.h"
+
+#include "common/Console.h"
+#include "common/BitUtils.h"
+#include "common/FileSystem.h"
+#include "common/HostSys.h"
+#include "common/Path.h"
+#include "common/SmallString.h"
+#include "common/StringUtil.h"
+#include "common/Threading.h"
+
+#include "imgui.h"
+
+#include <algorithm>
+#include <cstdio>
+#include <cstring>
+#include <string>
+#include <functional>
+#include <cmath>
+#include <limits>
+#include <ostream>
+#include <fstream>
+#include <atomic>
+#include <mutex>
+
+namespace
+{
+	std::mutex s_shader_param_mutex;
+	std::string s_shader_param_preset;
+	std::vector<std::pair<std::string, float>> s_shader_params;
+	std::atomic<u64> s_shader_param_generation{0};
+}
+
+void GSDevice::SetShaderChainParams(std::string preset, std::vector<std::pair<std::string, float>> params)
+{
+	{
+		std::unique_lock lock(s_shader_param_mutex);
+		s_shader_param_preset = std::move(preset);
+		s_shader_params = std::move(params);
+	}
+	s_shader_param_generation.fetch_add(1, std::memory_order_release);
+}
+
+u64 GSDevice::GetShaderChainParamGeneration()
+{
+	return s_shader_param_generation.load(std::memory_order_acquire);
+}
+
+bool GSDevice::GetShaderChainParams(const std::string& preset, std::vector<std::pair<std::string, float>>* out)
+{
+	std::unique_lock lock(s_shader_param_mutex);
+	if (s_shader_param_preset != preset || s_shader_params.empty())
+		return false;
+	*out = s_shader_params;
+	return true;
+}
+
+const char* ShaderEntryPoint(ShaderConvert value)
+{
+	switch (value)
+	{
+		// clang-format off
+		case ShaderConvert::COPY:                   return "ps_copy";
+		case ShaderConvert::RGB5A1_TO_16_BITS:      return "ps_convert_rgb5a1_16bits";
+		case ShaderConvert::DATM_1:                 return "ps_datm1";
+		case ShaderConvert::DATM_0:                 return "ps_datm0";
+		case ShaderConvert::DATM_1_RTA_CORRECTION:  return "ps_datm1_rta_correction";
+		case ShaderConvert::DATM_0_RTA_CORRECTION:  return "ps_datm0_rta_correction";
+		case ShaderConvert::COLCLIP_INIT:           return "ps_colclip_init";
+		case ShaderConvert::COLCLIP_RESOLVE:        return "ps_colclip_resolve";
+		case ShaderConvert::RTA_CORRECTION:         return "ps_rta_correction";
+		case ShaderConvert::RTA_DECORRECTION:       return "ps_rta_decorrection";
+		case ShaderConvert::TRANSPARENCY_FILTER:    return "ps_filter_transparency";
+		case ShaderConvert::DEPTH32_TO_16_BITS:     return "ps_convert_depth32_32bits";
+		case ShaderConvert::DEPTH32_TO_32_BITS:     return "ps_convert_depth32_32bits";
+		case ShaderConvert::DEPTH32_TO_RGBA8:       return "ps_convert_depth32_rgba8";
+		case ShaderConvert::DEPTH32_TO_RGB8:        return "ps_convert_depth32_rgba8";
+		case ShaderConvert::DEPTH16_TO_RGB5A1:      return "ps_convert_depth16_rgb5a1";
+		case ShaderConvert::RGBA8_TO_DEPTH32:       return "ps_convert_rgba8_depth32";
+		case ShaderConvert::RGBA8_TO_DEPTH24:       return "ps_convert_rgba8_depth24";
+		case ShaderConvert::RGBA8_TO_DEPTH16:       return "ps_convert_rgba8_depth16";
+		case ShaderConvert::RGB5A1_TO_DEPTH16:      return "ps_convert_rgb5a1_depth16";
+		case ShaderConvert::DEPTH32_TO_DEPTH24:     return "ps_convert_depth32_depth24";
+		case ShaderConvert::DEPTH_COPY:             return "ps_depth_copy";
+		case ShaderConvert::DOWNSAMPLE_COPY:        return "ps_downsample_copy";
+		case ShaderConvert::RGBA_TO_8I:             return "ps_convert_rgba_8i";
+		case ShaderConvert::RGB5A1_TO_8I:           return "ps_convert_rgb5a1_8i";
+		case ShaderConvert::CLUT_4:                 return "ps_convert_clut_4";
+		case ShaderConvert::CLUT_8:                 return "ps_convert_clut_8";
+		case ShaderConvert::YUV:                    return "ps_yuv";
+		// clang-format on
+		default:
+			pxAssert(0);
+			return "ShaderConvertUnknownShader";
+	}
+}
+
+const char* ShaderEntryPoint(PresentShader value)
+{
+	switch (value)
+	{
+		// clang-format off
+		case PresentShader::COPY:               return "ps_copy";
+		case PresentShader::SCANLINE:           return "ps_filter_scanlines";
+		case PresentShader::DIAGONAL_FILTER:    return "ps_filter_diagonal";
+		case PresentShader::TRIANGULAR_FILTER:  return "ps_filter_triangular";
+		case PresentShader::COMPLEX_FILTER:     return "ps_filter_complex";
+		case PresentShader::LOTTES_FILTER:      return "ps_filter_lottes";
+		case PresentShader::SUPERSAMPLE_4xRGSS: return "ps_4x_rgss";
+		case PresentShader::SUPERSAMPLE_AUTO:   return "ps_automagical_supersampling";
+		case PresentShader::SGSR:               return "ps_sgsr";
+			// clang-format on
+		default:
+			pxAssert(0);
+			return "DisplayShaderUnknownShader";
+	}
+}
+
+const char* ShaderConvertName(ShaderConvert shader)
+{
+	#define ENTRY(x) case ShaderConvert::x: return #x
+	switch (shader)
+	{
+		ENTRY(COPY);
+		ENTRY(DEPTH_COPY);
+		ENTRY(RGB5A1_TO_16_BITS);
+		ENTRY(DATM_1);
+		ENTRY(DATM_0);
+		ENTRY(DATM_1_RTA_CORRECTION);
+		ENTRY(DATM_0_RTA_CORRECTION);
+		ENTRY(COLCLIP_INIT);
+		ENTRY(COLCLIP_RESOLVE);
+		ENTRY(RTA_CORRECTION);
+		ENTRY(RTA_DECORRECTION);
+		ENTRY(TRANSPARENCY_FILTER);
+		ENTRY(DEPTH32_TO_16_BITS);
+		ENTRY(DEPTH32_TO_32_BITS);
+		ENTRY(DEPTH32_TO_RGBA8);
+		ENTRY(DEPTH32_TO_RGB8);
+		ENTRY(DEPTH16_TO_RGB5A1);
+		ENTRY(RGBA8_TO_DEPTH32);
+		ENTRY(RGBA8_TO_DEPTH24);
+		ENTRY(RGBA8_TO_DEPTH16);
+		ENTRY(RGB5A1_TO_DEPTH16);
+		ENTRY(DEPTH32_TO_DEPTH24);
+		ENTRY(DOWNSAMPLE_COPY);
+		ENTRY(RGBA_TO_8I);
+		ENTRY(RGB5A1_TO_8I);
+		ENTRY(CLUT_4);
+		ENTRY(CLUT_8);
+		ENTRY(YUV);
+		case ShaderConvert::Count: break;
+	}
+	#undef ENTRY
+	pxAssert(false);
+	return nullptr;
+}
+
+#ifdef PCSX2_DEVBUILD
+
+enum class TextureLabel
+{
+	ColorRT,
+	ColorHQRT,
+	ColorHDRRT,
+	ColorClipRT,
+	U16RT,
+	U32RT,
+	DepthStencil,
+	PrimIDTexture,
+	RWTexture,
+	CLUTTexture,
+	Texture,
+	ReplacementTexture,
+	Other,
+	Last = Other,
+};
+
+static std::array<u32, static_cast<u32>(TextureLabel::Last) + 1> s_texture_counts;
+
+static TextureLabel GetTextureLabel(GSTexture::Usage usage, GSTexture::Format format)
+{
+	if (GSTexture::IsRenderTarget(usage))
+	{
+		switch (format)
+		{
+			case GSTexture::Format::Color:
+				return TextureLabel::ColorRT;
+			case GSTexture::Format::ColorHQ:
+				return TextureLabel::ColorHQRT;
+			case GSTexture::Format::ColorHDR:
+				return TextureLabel::ColorHDRRT;
+			case GSTexture::Format::ColorClip:
+				return TextureLabel::ColorClipRT;
+			case GSTexture::Format::UInt16:
+				return TextureLabel::U16RT;
+			case GSTexture::Format::UInt32:
+				return TextureLabel::U32RT;
+			case GSTexture::Format::PrimID:
+				return TextureLabel::PrimIDTexture;
+			default:
+				return TextureLabel::Other;
+		}
+	}
+	else if (GSTexture::IsTexture(usage))
+	{
+		switch (format)
+		{
+			case GSTexture::Format::Color:
+				return TextureLabel::Texture;
+			case GSTexture::Format::UNorm8:
+				return TextureLabel::CLUTTexture;
+			case GSTexture::Format::BC1:
+			case GSTexture::Format::BC2:
+			case GSTexture::Format::BC3:
+			case GSTexture::Format::BC7:
+			case GSTexture::Format::ColorHDR:
+				return TextureLabel::ReplacementTexture;
+			default:
+				return TextureLabel::Other;
+		}
+	}
+	else if (GSTexture::IsDepthStencil(usage))
+	{
+		return TextureLabel::DepthStencil;
+	}
+	else if (GSTexture::IsShaderWrite(usage))
+	{
+		return TextureLabel::RWTexture;
+	}
+	else
+	{
+		return TextureLabel::Other;
+	}
+}
+
+// Debug names
+static const char* TextureLabelString(TextureLabel label)
+{
+	switch (label)
+	{
+		case TextureLabel::ColorRT:
+			return "Color RT";
+		case TextureLabel::ColorHQRT:
+			return "Color HQ RT";
+		case TextureLabel::ColorHDRRT:
+			return "Color HDR RT";
+		case TextureLabel::ColorClipRT:
+			return "Color Clip RT";
+		case TextureLabel::U16RT:
+			return "U16 RT";
+		case TextureLabel::U32RT:
+			return "U32 RT";
+		case TextureLabel::DepthStencil:
+			return "Depth Stencil";
+		case TextureLabel::PrimIDTexture:
+			return "PrimID";
+		case TextureLabel::RWTexture:
+			return "RW Texture";
+		case TextureLabel::CLUTTexture:
+			return "CLUT Texture";
+		case TextureLabel::Texture:
+			return "Texture";
+		case TextureLabel::ReplacementTexture:
+			return "Replacement Texture";
+		case TextureLabel::Other:
+		default:
+			return "Unknown Texture";
+	}
+}
+
+#endif
+
+std::unique_ptr<GSDevice> g_gs_device;
+
+GSDevice::GSDevice()
+	: m_pass_scheduler(std::make_unique<GSPassScheduler>())
+{
+#ifdef PCSX2_DEVBUILD
+	s_texture_counts.fill(0);
+#endif
+}
+
+GSDevice::~GSDevice()
+{
+	// should've been cleaned up in Destroy()
+	pxAssert(m_pool[0].empty() && m_pool[1].empty() && !m_merge && !m_weavebob && !m_blend && !m_mad && !m_target_tmp && !m_cas && !m_fsr1_easu && !m_fsr1_output && !m_sgsr_output);
+}
+
+GSVector2i GSDevice::GetPresentationSize() const
+{
+	const s32 w = GetWindowWidth();
+	const s32 h = GetWindowHeight();
+	return (GSConfig.Rotation == DisplayRotation::Rot90 || GSConfig.Rotation == DisplayRotation::Rot270)
+			   ? GSVector2i(h, w)
+			   : GSVector2i(w, h);
+}
+
+DisplayRotation GSDevice::GetPresentRotation() const
+{
+	const u32 quarter_turns = static_cast<u32>(GSConfig.Rotation) + static_cast<u32>(GetSurfacePreRotation());
+	return static_cast<DisplayRotation>(quarter_turns % 4u);
+}
+
+const char* GSDevice::RenderAPIToString(RenderAPI api)
+{
+	switch (api)
+	{
+		// clang-format off
+#define CASE(x) case RenderAPI::x: return #x
+		CASE(None);
+		CASE(D3D11);
+		CASE(D3D12);
+		CASE(Metal);
+		CASE(Vulkan);
+		CASE(OpenGL);
+#undef CASE
+		// clang-format on
+	default:
+		return "Unknown";
+	}
+}
+
+bool GSDevice::GetRequestedExclusiveFullscreenMode(u32* width, u32* height, float* refresh_rate)
+{
+	const std::string mode = Host::GetStringSettingValue("EmuCore/GS", "FullscreenMode", "");
+	if (!mode.empty())
+	{
+		const std::string_view mode_view = mode;
+		std::string_view::size_type sep1 = mode.find('x');
+		if (sep1 != std::string_view::npos)
+		{
+			std::optional<u32> owidth = StringUtil::FromChars<u32>(mode_view.substr(0, sep1));
+			sep1++;
+
+			while (sep1 < mode.length() && std::isspace(mode[sep1]))
+				sep1++;
+
+			if (owidth.has_value() && sep1 < mode.length())
+			{
+				std::string_view::size_type sep2 = mode.find('@', sep1);
+				if (sep2 != std::string_view::npos)
+				{
+					std::optional<u32> oheight = StringUtil::FromChars<u32>(mode_view.substr(sep1, sep2 - sep1));
+					sep2++;
+
+					while (sep2 < mode.length() && std::isspace(mode[sep2]))
+						sep2++;
+
+					if (oheight.has_value() && sep2 < mode.length())
+					{
+						std::optional<float> orefresh_rate = StringUtil::FromChars<float>(mode_view.substr(sep2));
+						if (orefresh_rate.has_value())
+						{
+							*width = owidth.value();
+							*height = oheight.value();
+							*refresh_rate = orefresh_rate.value();
+							return true;
+						}
+					}
+				}
+			}
+		}
+	}
+
+	*width = 0;
+	*height = 0;
+	*refresh_rate = 0;
+	return false;
+}
+
+std::string GSDevice::GetFullscreenModeString(u32 width, u32 height, float refresh_rate)
+{
+	return StringUtil::StdStringFromFormat("%u x %u @ %f Hz", width, height, refresh_rate);
+}
+
+void GSDevice::GenerateExpansionIndexBuffer(void* buffer)
+{
+	static constexpr u32 MAX_INDEX = EXPAND_BUFFER_SIZE / 6 / sizeof(u16);
+
+	u16* idx_buffer = static_cast<u16*>(buffer);
+	for (u32 i = 0; i < MAX_INDEX; i++)
+	{
+		const u32 base = i * 4;
+		*(idx_buffer++) = base + 0;
+		*(idx_buffer++) = base + 1;
+		*(idx_buffer++) = base + 2;
+		*(idx_buffer++) = base + 1;
+		*(idx_buffer++) = base + 2;
+		*(idx_buffer++) = base + 3;
+	}
+}
+
+GSVector4i GSDevice::ProcessCopyArea(const GSVector4i& rtsize, const GSVector4i& drawarea)
+{
+	GSVector4i snapped_drawarea(drawarea);
+	// We don't want the snapped box adjustments when the rect is empty as it might make the copy to pass.
+	// The empty rect itself needs to be handled in renderer properly.
+	if (snapped_drawarea.rempty())
+		return snapped_drawarea;
+
+	// If copy area exceeds 95% coverage then we can do a full copy instead which should be faster.
+	const float rt_area = static_cast<float>(rtsize.width() * rtsize.height());
+	const float copy_area = static_cast<float>(drawarea.width() * drawarea.height());
+	constexpr float coverage = 0.95f;
+	if ((copy_area / rt_area) >= coverage)
+	{
+		snapped_drawarea = rtsize;
+		return snapped_drawarea;
+	}
+
+	// Aligning bbox to 4 pixel boundaries so copies will be faster using Direct Memory Access,
+	// otherwise it may stall as more commands need to be issued.
+	snapped_drawarea = snapped_drawarea.ralign<Align_Outside>(GSVector2i(4, 4)).rintersect(rtsize);
+
+	return snapped_drawarea;
+}
+
+std::optional<std::string> GSDevice::ReadShaderSource(const char* filename)
+{
+	return FileSystem::ReadFileToString(Path::Combine(EmuFolders::Resources, filename).c_str());
+}
+
+int GSDevice::GetMipmapLevelsForSize(int width, int height)
+{
+	return std::min(static_cast<int>(std::log2(std::max(width, height))) + 1, MAXIMUM_TEXTURE_MIPMAP_LEVELS);
+}
+
+bool GSDevice::Create(GSVSyncMode vsync_mode, bool allow_present_throttle)
+{
+	m_vsync_mode = vsync_mode;
+	m_allow_present_throttle = allow_present_throttle;
+	return true;
+}
+
+void GSDevice::Destroy()
+{
+	m_pass_scheduler->Clear();
+	m_deferred_draw_count = 0;
+	std::vector<GSTexture*> pending;
+	pending.swap(m_deferred_recycle);
+	for (GSTexture* tex : pending)
+		Recycle(tex);
+	ClearCurrent();
+	PurgePool();
+}
+
+bool GSDevice::AcquireWindow(bool recreate_window)
+{
+	std::optional<WindowInfo> wi = Host::AcquireRenderWindow(recreate_window);
+	if (!wi.has_value())
+	{
+		Console.Error("Failed to acquire render window.");
+		Host::ReportErrorAsync("Error", "Failed to acquire render window. The log may have more information.");
+		return false;
+	}
+
+	m_window_info = std::move(wi.value());
+	return true;
+}
+
+bool GSDevice::ShouldSkipPresentingFrame()
+{
+	// Only needed with FIFO.
+	if (!m_allow_present_throttle || m_vsync_mode != GSVSyncMode::FIFO)
+		return false;
+
+	const float throttle_rate = (m_window_info.surface_refresh_rate > 0.0f) ? m_window_info.surface_refresh_rate : 60.0f;
+	const u64 throttle_period = static_cast<u64>(static_cast<double>(GetTickFrequency()) / static_cast<double>(throttle_rate));
+
+	const u64 now = GetCPUTicks();
+	const double diff = now - m_last_frame_displayed_time;
+	if (diff < throttle_period)
+		return true;
+
+	m_last_frame_displayed_time = now;
+	return false;
+}
+
+void GSDevice::ThrottlePresentation()
+{
+	// Manually throttle presentation when vsync isn't enabled, so we don't try to render the
+	// fullscreen UI at thousands of FPS and make the gpu go brrrrrrrr.
+	const float throttle_rate = (m_window_info.surface_refresh_rate > 0.0f) ? m_window_info.surface_refresh_rate : 60.0f;
+
+	const u64 sleep_period = static_cast<u64>(static_cast<double>(GetTickFrequency()) / static_cast<double>(throttle_rate));
+	const u64 current_ts = GetCPUTicks();
+
+	// Allow it to fall behind/run ahead up to 2*period. Sleep isn't that precise, plus we need to
+	// allow time for the actual rendering.
+	const u64 max_variance = sleep_period * 2;
+	if (static_cast<u64>(std::abs(static_cast<s64>(current_ts - m_last_frame_displayed_time))) > max_variance)
+		m_last_frame_displayed_time = current_ts + sleep_period;
+	else
+		m_last_frame_displayed_time += sleep_period;
+
+	Threading::SleepUntil(m_last_frame_displayed_time);
+}
+
+void GSDevice::ClearRenderTarget(GSTexture* t, u32 c)
+{
+	FlushDeferredDrawsFor(t);
+	t->SetClearColor(c);
+}
+
+void GSDevice::ClearDepth(GSTexture* t, float d)
+{
+	FlushDeferredDrawsFor(t);
+	t->SetClearDepth(d);
+}
+
+bool GSDevice::ProcessClearsBeforeCopy(GSTexture* sTex, GSTexture* dTex, const bool full_copy)
+{
+	FlushDeferredDraws(GSFlushCause::Copy);
+	pxAssert(sTex->GetState() == GSTexture::State::Cleared && dTex->IsRenderTargetOrDepthStencil());
+
+	// Pass it forward if we're clearing the whole thing.
+	if (full_copy)
+	{
+		if (dTex->IsDepthStencil())
+			dTex->SetClearDepth(sTex->GetClearDepth());
+		else
+			dTex->SetClearColor(sTex->GetClearColor());
+
+		dTex->SetState(GSTexture::State::Cleared);
+
+		return true;
+	}
+
+	// Destination is cleared, if it's the same colour and rect, we can just avoid this entirely.
+	if (dTex->GetState() == GSTexture::State::Cleared)
+	{
+		if (dTex->IsDepthStencil())
+		{
+			if (dTex->GetClearDepth() == sTex->GetClearDepth())
+				return true;
+		}
+		else
+		{
+			if (dTex->GetClearColor() == sTex->GetClearColor())
+				return true;
+		}
+	}
+
+	return false;
+}
+
+void GSDevice::InvalidateRenderTarget(GSTexture* t)
+{
+	FlushDeferredDrawsFor(t);
+	t->SetState(GSTexture::State::Invalidated);
+}
+
+void GSDevice::UpdateImGuiTextures()
+{
+	// TODO, use ImDrawData https://github.com/ocornut/imgui/issues/8597#issuecomment-2871835598
+	for (ImTextureData* im_tex : ImGui::GetPlatformIO().Textures)
+	{
+		switch (im_tex->Status)
+		{
+			case ImTextureStatus_OK:
+			case ImTextureStatus_Destroyed:
+				continue;
+			case ImTextureStatus_WantCreate:
+				if (GSTexture* gs_tex = g_gs_device->CreateTexture(im_tex->Width, im_tex->Height, 1, GSTexture::Format::Color))
+				{
+					im_tex->SetTexID(reinterpret_cast<ImTextureID>(gs_tex->GetNativeHandle()));
+					im_tex->BackendUserData = gs_tex;
+				}
+				else
+				{
+					pxFailRel("Failed to create ImGui texture");
+					break;
+				}
+				[[fallthrough]];
+			case ImTextureStatus_WantUpdates:
+				if (GSTexture* gs_tex = static_cast<GSTexture*>(im_tex->BackendUserData))
+				{
+					// If we fell through from WantCreate, then we are uploading the full size
+					// Otherwise, we are just updating the specified region
+					// clange-format off
+					const int upload_x = (im_tex->Status == ImTextureStatus_WantCreate) ? 0 : im_tex->UpdateRect.x;
+					const int upload_y = (im_tex->Status == ImTextureStatus_WantCreate) ? 0 : im_tex->UpdateRect.y;
+					const int upload_w = (im_tex->Status == ImTextureStatus_WantCreate) ? im_tex->Width : im_tex->UpdateRect.w;
+					const int upload_h = (im_tex->Status == ImTextureStatus_WantCreate) ? im_tex->Height : im_tex->UpdateRect.h;
+					const int upload_pitch = upload_w * im_tex->BytesPerPixel;
+					// clange-format on
+
+					const GSVector4i rect{
+						upload_x,
+						upload_y,
+						upload_x + upload_w,
+						upload_y + upload_h,
+					};
+
+					GSTexture::GSMap map;
+					if (gs_tex->Map(map, &rect))
+					{
+						for (int y = 0; y < upload_h; y++)
+							std::memcpy(map.bits + map.pitch * y, im_tex->GetPixelsAt(rect.x, rect.y + y), upload_pitch);
+
+						gs_tex->Unmap();
+					}
+					else
+					{
+						for (int y = 0; y < upload_h; y++)
+							gs_tex->Update({rect.left, rect.top + y, rect.right, rect.top + y + 1},
+								im_tex->GetPixelsAt(rect.x, rect.y + y), upload_pitch);
+					}
+
+					im_tex->Status = ImTextureStatus_OK;
+				}
+				break;
+			case ImTextureStatus_WantDestroy:
+				if (GSTexture* gs_tex = static_cast<GSTexture*>(im_tex->BackendUserData))
+				{
+					// While it's unlikely we're going to reuse the same size as imgui for rendering,
+					// imgui may request a new atlas of the same size if old font sizes are evicted.
+					Recycle(gs_tex);
+
+					im_tex->SetTexID(ImTextureID_Invalid);
+					im_tex->BackendUserData = nullptr;
+					im_tex->Status = ImTextureStatus_Destroyed;
+				}
+				break;
+			default:
+				pxAssert(false);
+				break;
+		}
+	}
+}
+
+void GSDevice::DestroyImGuiTextures()
+{
+	if (!ImGui::GetCurrentContext())
+		return;
+
+	for (ImTextureData* im_tex : ImGui::GetPlatformIO().Textures)
+	{
+		if (im_tex->Status != ImTextureStatus_Destroyed)
+		{
+			GSTexture* gs_tex = static_cast<GSTexture*>(im_tex->BackendUserData);
+			if (gs_tex == nullptr)
+				continue;
+
+			Recycle(gs_tex);
+
+			pxAssert(im_tex->RefCount == 1);
+
+			im_tex->SetTexID(ImTextureID_Invalid);
+			im_tex->BackendUserData = nullptr;
+			im_tex->Status = ImTextureStatus_Destroyed;
+		}
+	}
+}
+
+void GSDevice::TextureRecycleDeleter::operator()(GSTexture* const tex)
+{
+	g_gs_device->Recycle(tex);
+}
+
+GSTexture* GSDevice::FetchSurface(GSTexture::Usage usage, const GSVector2i& size, int levels, GSTexture::Format format, bool clear, bool prefer_reuse)
+{
+	return FetchSurface(usage, size.x, size.y, levels, format, clear, prefer_reuse);
+}
+
+GSTexture* GSDevice::FetchSurface(GSTexture::Usage usage, int width, int height, int levels, GSTexture::Format format, bool clear, bool prefer_reuse)
+{
+	const GSVector2i size(std::clamp(width, 1, static_cast<int>(g_gs_device->GetMaxTextureSize())),
+		std::clamp(height, 1, static_cast<int>(g_gs_device->GetMaxTextureSize())));
+	// A queued reader can keep an otherwise reusable surface out of the pool.
+	// Drain only an exact match which this caller allows to be reused this frame;
+	// Recycle() stamps it with the current frame when the queued reader completes.
+	if (prefer_reuse && !m_deferred_recycle.empty() && !m_flushing)
+	{
+		for (const GSTexture* held : m_deferred_recycle)
+		{
+			if (held->GetUsage() == usage && held->GetFormat() == format && held->GetSize() == size &&
+				held->GetMipmapLevels() == levels)
+			{
+				FlushDeferredDraws(GSFlushCause::Pool);
+				break;
+			}
+		}
+	}
+
+	FastList<GSTexture*>& pool = m_pool[!GSTexture::IsTexture(usage)];
+
+	GSTexture* t = nullptr;
+
+	for (auto i = pool.begin(); i != pool.end(); ++i)
+	{
+		t = *i;
+
+		pxAssert(t);
+
+		if (t->GetUsage() == usage && t->GetFormat() == format && t->GetSize() == size && t->GetMipmapLevels() == levels)
+		{
+			if (prefer_reuse || t->GetLastFrameUsed() != m_frame)
+			{
+				m_pool_memory_usage -= t->GetMemUsage();
+				pool.erase(i);
+				break;
+			}
+		}
+
+		t = nullptr;
+	}
+
+	if (!t)
+	{
+		// A surface used earlier in this frame can still contain an intermediate pass result.
+		// Never overwrite it merely because the retained pool reached its soft limit.
+		t = CreateSurface(usage, size.x, size.y, levels, format);
+		if (!t)
+		{
+			ERROR_LOG("GS: Memory allocation failure for {}x{} texture. Purging pool and retrying.", size.x, size.y);
+			PurgePool();
+			t = CreateSurface(usage, size.x, size.y, levels, format);
+			if (!t)
+			{
+				ERROR_LOG("GS: Memory allocation failure for {}x{} texture after purging pool.", size.x, size.y);
+				return nullptr;
+			}
+		}
+
+#ifdef PCSX2_DEVBUILD
+		if (GSConfig.UseDebugDevice)
+		{
+			const TextureLabel label = GetTextureLabel(usage, format);
+			const u32 id = ++s_texture_counts[static_cast<u32>(label)];
+			t->SetDebugName(TinyString::from_format("{} {}", TextureLabelString(label), id));
+		}
+#endif
+	}
+
+	if (t->IsRenderTarget())
+	{
+		if (clear)
+			ClearRenderTarget(t, 0);
+		else
+			InvalidateRenderTarget(t);
+	}
+	else if (t->IsDepthStencil())
+	{
+		if (clear)
+			ClearDepth(t, 0.0f);
+		else
+			InvalidateRenderTarget(t);
+	}
+
+	return t;
+}
+
+void GSDevice::Recycle(GSTexture* t)
+{
+	if (!t)
+		return;
+	if (m_deferred_draw_count != 0 && !m_flushing && DeferredDrawsReference(t))
+	{
+		m_deferred_recycle.push_back(t);
+		return;
+	}
+
+	t->SetLastFrameUsed(m_frame);
+	
+#ifdef PCSX2_DEVBUILD
+	t->SetDebugName("");
+#endif
+
+	FastList<GSTexture*>& pool = m_pool[!t->IsTexture()];
+	pool.push_front(t);
+	m_pool_memory_usage += t->GetMemUsage();
+
+	const u32 max_size = GetPoolLimit(t->IsTexture());
+	const u32 max_age = GetPoolMaxAge(t->IsTexture());
+	while (pool.size() > max_size)
+	{
+		// Don't toss when the texture was last used in this frame.
+		// Because we're going to need to keep it alive anyway.
+		GSTexture* back = pool.back();
+		if ((m_frame - back->GetLastFrameUsed()) < max_age)
+			break;
+
+		m_pool_memory_usage -= back->GetMemUsage();
+		delete back;
+
+		pool.pop_back();
+	}
+}
+
+bool GSDevice::UsesLowerLeftOrigin() const
+{
+	const RenderAPI api = GetRenderAPI();
+	return (api == RenderAPI::OpenGL);
+}
+
+void GSDevice::AgePool()
+{
+	FlushDeferredDraws(GSFlushCause::Pool);
+	m_frame++;
+
+	// Toss out textures when they're not too-recently used.
+	for (u32 pool_idx = 0; pool_idx < m_pool.size(); pool_idx++)
+	{
+		const u32 max_age = GetPoolMaxAge(pool_idx == 0);
+		FastList<GSTexture*>& pool = m_pool[pool_idx];
+		while (!pool.empty())
+		{
+			GSTexture* back = pool.back();
+			if ((m_frame - back->GetLastFrameUsed()) < max_age)
+				break;
+
+			m_pool_memory_usage -= back->GetMemUsage();
+			delete back;
+
+			pool.pop_back();
+		}
+	}
+}
+
+void GSDevice::AgePoolAfterPresentCapSkip()
+{
+	FlushDeferredDraws(GSFlushCause::Pool);
+	m_frame++;
+
+	// Only deletion scanning is amortized, bounded to four cap-created skips.
+	static constexpr u32 MAX_CLEANUP_DEFERRAL = 4;
+	if (++m_frames_since_pool_cleanup < MAX_CLEANUP_DEFERRAL)
+		return;
+	m_frames_since_pool_cleanup = 0;
+
+	// Toss out textures when they're not too-recently used.
+	for (u32 pool_idx = 0; pool_idx < m_pool.size(); pool_idx++)
+	{
+		const u32 max_age = GetPoolMaxAge(pool_idx == 0);
+		FastList<GSTexture*>& pool = m_pool[pool_idx];
+		while (!pool.empty())
+		{
+			GSTexture* back = pool.back();
+			if ((m_frame - back->GetLastFrameUsed()) < max_age)
+				break;
+
+			m_pool_memory_usage -= back->GetMemUsage();
+			delete back;
+
+			pool.pop_back();
+		}
+	}
+}
+
+u32 GSDevice::GetPoolLimit(bool texture) const
+{
+	// One resource policy for every GPU: shrinking the pools is not a safe way to classify a
+	// weaker device and increases allocation churn.
+	return texture ? MAX_POOLED_TEXTURES : MAX_POOLED_TARGETS;
+}
+
+u32 GSDevice::GetPoolMaxAge(bool texture) const
+{
+	return texture ? MAX_TEXTURE_AGE : MAX_TARGET_AGE;
+}
+
+void GSDevice::PurgePool()
+{
+	FlushDeferredDraws(GSFlushCause::Pool);
+	m_frames_since_pool_cleanup = 0;
+	for (FastList<GSTexture*>& pool : m_pool)
+	{
+		for (GSTexture* t : pool)
+			delete t;
+		pool.clear();
+	}
+	m_pool_memory_usage = 0;
+}
+
+GSTexture* GSDevice::CreateRenderTarget(int w, int h, GSTexture::Format format, bool clear, bool prefer_reuse)
+{
+	return FetchSurface(GSTexture::RenderTarget, w, h, 1, format, clear, prefer_reuse);
+}
+
+GSTexture* GSDevice::CreateRenderTarget(const GSVector2i& size, GSTexture::Format format, bool clear, bool prefer_reuse)
+{
+	return FetchSurface(GSTexture::RenderTarget, size.x, size.y, 1, format, clear, prefer_reuse);
+}
+
+GSTexture* GSDevice::CreateFeedbackTarget(int w, int h, GSTexture::Format format, bool clear, bool prefer_reuse)
+{
+	return FetchSurface(GSTexture::FeedbackTarget, w, h, 1, format, clear, prefer_reuse);
+}
+
+GSTexture* GSDevice::CreateFeedbackTarget(const GSVector2i& size, GSTexture::Format format, bool clear, bool prefer_reuse)
+{
+	return FetchSurface(GSTexture::FeedbackTarget, size.x, size.y, 1, format, clear, prefer_reuse);
+}
+
+GSTexture* GSDevice::CreateShaderWriteTarget(int w, int h, GSTexture::Format format, bool clear, bool prefer_reuse)
+{
+	return FetchSurface(GSTexture::ShaderWriteTarget, w, h, 1, format, clear, prefer_reuse);
+}
+
+GSTexture* GSDevice::CreateShaderWriteTarget(const GSVector2i& size, GSTexture::Format format, bool clear, bool prefer_reuse)
+{
+	return FetchSurface(GSTexture::ShaderWriteTarget, size.x, size.y, 1, format, clear, prefer_reuse);
+}
+
+GSTexture::Usage GSDevice::GetDepthStencilUsage() const
+{
+	return (m_features.depth_feedback != DepthFeedbackSupport::None) ? GSTexture::FeedbackDepth : GSTexture::DepthStencil;
+}
+
+GSTexture* GSDevice::CreateDepthStencil(int w, int h, bool clear, bool prefer_reuse)
+{
+	return FetchSurface(GetDepthStencilUsage(), w, h, 1, GSTexture::Format::DepthStencil, clear, prefer_reuse);
+}
+
+GSTexture* GSDevice::CreateDepthStencil(const GSVector2i& size, bool clear, bool prefer_reuse)
+{
+	return FetchSurface(GetDepthStencilUsage(), size.x, size.y, 1, GSTexture::Format::DepthStencil, clear, prefer_reuse);
+}
+
+GSTexture* GSDevice::CreateTexture(int w, int h, int mipmap_levels, GSTexture::Format format, bool prefer_reuse)
+{
+	pxAssert(mipmap_levels != 0 && (mipmap_levels < 0 || mipmap_levels <= GetMipmapLevelsForSize(w, h)));
+	const int levels = mipmap_levels < 0 ? GetMipmapLevelsForSize(w, h) : mipmap_levels;
+	return FetchSurface(GSTexture::Texture, w, h, levels, format, false, !m_features.prefer_new_textures || prefer_reuse);
+}
+
+GSTexture* GSDevice::CreateTexture(const GSVector2i& size, int mipmap_levels, GSTexture::Format format, bool prefer_reuse)
+{
+	return CreateTexture(size.x, size.y, mipmap_levels, format, prefer_reuse);
+}
+
+GSTexture* GSDevice::CreateCompatible(GSTexture* tex, bool clear, bool prefer_reuse)
+{
+	return CreateCompatible(tex, tex->GetWidth(), tex->GetHeight(), clear, prefer_reuse);
+}
+
+GSTexture* GSDevice::CreateCompatible(GSTexture* tex, const GSVector2i& size, bool clear, bool prefer_reuse)
+{
+	return CreateCompatible(tex, size.x, size.y, clear, prefer_reuse);
+}
+
+GSTexture* GSDevice::CreateCompatible(GSTexture* tex, int w, int h, bool clear, bool prefer_reuse)
+{
+	return FetchSurface(tex->GetUsage(), w, h, 1, tex->GetFormat(), clear, prefer_reuse);
+}
+
+void GSDevice::DoStretchRectWithAssertions(GSTexture* sTex, const GSVector4& sRect, GSTexture* dTex,
+	const GSVector4& dRect, ShaderConvertSelector shader, Filter filter)
+{
+	pxAssert((dTex && dTex->IsDepthLike()) == shader.Float32Output());
+	pxAssert((dTex && dTex->IsDepthStencil()) == shader.DepthOutput());
+	pxAssert(!(filter == Biln && shader.SupportsBilinear())); // Don't allow HW bilinear if SW bilinear is required.
+	GL_INS("StretchRect(%s) {%d,%d} %dx%d -> {%d,%d) %dx%d", ShaderConvertName(shader.Shader()),
+		int(sRect.left), int(sRect.top),
+		int(sRect.right - sRect.left), int(sRect.bottom - sRect.top), int(dRect.left), int(dRect.top),
+		int(dRect.right - dRect.left), int(dRect.bottom - dRect.top));
+	DoStretchRect(sTex, sRect, dTex, dRect, shader, filter);
+}
+
+// Resolves a StretchRect edge onto the texel grid. Both coordinate spaces reach us as integer
+// rects that were divided and re-multiplied by a texture dimension along the way, so the value
+// we see is the intended integer plus a few ULPs of round-trip error. Anything further off the
+// grid than that is a deliberate offset -- a half-texel inset, say -- and has to keep going
+// through the shader, which is why the tolerance is far below the smallest offset anyone means.
+static bool SnapStretchRectEdgeToTexel(float v, s32& out)
+{
+	constexpr double tolerance = 1.0 / 512.0;
+	// Reject non-finite/out-of-range coordinates before float-to-integer conversion.
+	const double rounded = std::round(static_cast<double>(v));
+	if (!std::isfinite(v) || rounded < std::numeric_limits<s32>::min() ||
+		rounded > std::numeric_limits<s32>::max() || std::abs(static_cast<double>(v) - rounded) > tolerance)
+	{
+		return false;
+	}
+	out = static_cast<s32>(rounded);
+	return true;
+}
+
+bool GSDevice::TryStretchRectAsCopy(GSTexture* sTex, const GSVector4& sRect, GSTexture* dTex,
+	const GSVector4& dRect, ShaderConvertSelector shader)
+{
+	// Only a plain copy is equivalent. Anything that reformats, rewrites channels or moves
+	// colour into depth needs the shader that was asked for.
+	const ShaderConvert sh = shader.Shader();
+	if ((sh != ShaderConvert::COPY && sh != ShaderConvert::DEPTH_COPY) || shader.Mask() != 0xf)
+		return false;
+
+	if (!sTex || !dTex || sTex == dTex || sTex->GetFormat() != dTex->GetFormat())
+		return false;
+
+	// Copies are per-aspect, so a colour-usage texture and a depth-usage one can't be copied
+	// between even when their formats agree.
+	if (sTex->IsDepthStencil() != dTex->IsDepthStencil())
+		return false;
+
+	// Vulkan CopyRect copies only the depth aspect. GL copy-image also copies
+	// stencil, which DEPTH_COPY must preserve in the destination.
+	if (dTex->IsDepthStencil() && GetRenderAPI() != RenderAPI::Vulkan)
+		return false;
+
+	// Preserve the draw path's output/aspect contract before bypassing its assertions.
+	if (dTex->IsDepthLike() != shader.Float32Output() || dTex->IsDepthStencil() != shader.DepthOutput())
+		return false;
+
+	// A source that is a pending clear or is invalidated has no contents to copy, and the two
+	// paths resolve that from opposite ends -- the draw path carries the clear into the
+	// destination's load op, the copy path commits it to the source first. Neither is what this
+	// exists for, so leave them where they already work.
+	if (sTex->GetState() != GSTexture::State::Dirty)
+		return false;
+
+	const GSVector2i ssize = sTex->GetSize();
+	const GSVector2i dsize = dTex->GetSize();
+
+	// Source coordinates arrive normalized, destination coordinates in pixels.
+	s32 sx, sy, sz, sw, dx, dy, dz, dw;
+	if (!SnapStretchRectEdgeToTexel(sRect.x * static_cast<float>(ssize.x), sx) ||
+		!SnapStretchRectEdgeToTexel(sRect.y * static_cast<float>(ssize.y), sy) ||
+		!SnapStretchRectEdgeToTexel(sRect.z * static_cast<float>(ssize.x), sz) ||
+		!SnapStretchRectEdgeToTexel(sRect.w * static_cast<float>(ssize.y), sw) ||
+		!SnapStretchRectEdgeToTexel(dRect.x, dx) || !SnapStretchRectEdgeToTexel(dRect.y, dy) ||
+		!SnapStretchRectEdgeToTexel(dRect.z, dz) || !SnapStretchRectEdgeToTexel(dRect.w, dw))
+	{
+		return false;
+	}
+
+	// The draw path scissors an out-of-bounds destination and clamps out-of-bounds source
+	// coordinates to the edge texel. A copy can do neither, so those stay with the shader.
+	if (sx < 0 || sy < 0 || sz > ssize.x || sw > ssize.y || dx < 0 || dy < 0 || dz > dsize.x || dw > dsize.y)
+		return false;
+
+	// Bounds are checked before subtracting signed edges, so extents cannot overflow.
+	// 1:1 only -- a scaled copy is a resample, and then the filter the caller asked for matters.
+	// At 1:1 every sample lands dead centre on its texel, so Nearest and Biln agree with each
+	// other and with the copy, which is why the filter isn't consulted here.
+	if (sz <= sx || sw <= sy || dz <= dx || dw <= dy || (sz - sx) != (dz - dx) || (sw - sy) != (dw - dy))
+		return false;
+
+	GL_INS("StretchRect(%s) served as copy: {%d,%d} %dx%d -> {%d,%d}", ShaderConvertName(sh), sx, sy, sz - sx,
+		sw - sy, dx, dy);
+
+	CopyRect(sTex, dTex, GSVector4i(sx, sy, sz, sw), static_cast<u32>(dx), static_cast<u32>(dy));
+	return true;
+}
+
+void GSDevice::StretchRect(GSTexture* sTex, const GSVector4& sRect, GSTexture* dTex, const GSVector4& dRect,
+	ShaderConvertSelector shader, Filter filter)
+{
+	FlushDeferredDraws(GSFlushCause::Copy);
+	if (TryStretchRectAsCopy(sTex, sRect, dTex, dRect, shader))
+		return;
+	DoStretchRectWithAssertions(sTex, sRect, dTex, dRect, shader, filter);
+}
+
+void GSDevice::StretchRect(GSTexture* sTex, GSTexture* dTex, const GSVector4& dRect, ShaderConvertSelector shader, Filter filter)
+{
+	StretchRect(sTex, GSVector4(0, 0, 1, 1), dTex, dRect, shader, filter);
+}
+
+void GSDevice::StretchRect(GSTexture* sTex, GSTexture* dTex, ShaderConvertSelector shader, Filter filter)
+{
+	StretchRect(sTex, dTex, GSVector4(dTex->GetRect()), shader, filter);
+}
+
+void GSDevice::StretchRectAuto(GSTexture* sTex, const GSVector4& sRect, GSTexture* dTex, const GSVector4& dRect,
+	Filter filter, u32 src_bpp, u32 dst_bpp)
+{
+	ShaderConvertSelector shader = GetConvertShader(sTex, dTex, src_bpp, dst_bpp);
+	if (shader.SupportsBilinear() && filter == Biln)
+	{
+		// Bilinear is emulated in the shader.
+		shader.SetFilter(Biln);
+		filter = Nearest;
+	}
+	StretchRect(sTex, sRect, dTex, dRect, shader, filter);
+}
+
+void GSDevice::StretchRectAuto(GSTexture* sTex, GSTexture* dTex, const GSVector4& dRect, Filter filter, u32 src_bpp, u32 dst_bpp)
+{
+	StretchRectAuto(sTex, GSVector4(0, 0, 1, 1), dTex, dRect, filter, src_bpp, dst_bpp);
+}
+
+void GSDevice::StretchRectAuto(GSTexture* sTex, GSTexture* dTex, Filter filter, u32 src_bpp, u32 dst_bpp)
+{
+	StretchRectAuto(sTex, dTex, GSVector4(dTex->GetRect()), filter, src_bpp, dst_bpp);
+}
+
+void GSDevice::StretchRectAutoMask(GSTexture* sTex, const GSVector4& sRect, GSTexture* dTex, const GSVector4& dRect,
+	bool red, bool green, bool blue, bool alpha, u32 src_bpp, u32 dst_bpp)
+{
+	StretchRect(sTex, sRect, dTex, dRect, GetConvertShaderMask(sTex, dTex, src_bpp, dst_bpp, red, green, blue, alpha), Nearest);
+}
+
+void GSDevice::StretchRectAutoMask(GSTexture* sTex, GSTexture* dTex, const GSVector4& dRect, bool red, bool green, bool blue, bool alpha, u32 src_bpp, u32 dst_bpp)
+{
+	StretchRectAutoMask(sTex, GSVector4(0, 0, 1, 1), dTex, dRect, red, green, blue, alpha, src_bpp, dst_bpp);
+}
+
+void GSDevice::StretchRectAutoMask(GSTexture* sTex, GSTexture* dTex, bool red, bool green, bool blue, bool alpha,
+	u32 src_bpp, u32 dst_bpp)
+{
+	StretchRectAutoMask(sTex, dTex, GSVector4(dTex->GetRect()), red, green, blue, alpha, src_bpp, dst_bpp);
+}
+
+bool GSDevice::DeferredDrawsReference(const GSTexture* tex) const
+{
+	return m_pass_scheduler->References(tex);
+}
+
+void GSDevice::FlushDeferredDrawsFor(const GSTexture* tex)
+{
+	if (m_pass_scheduler->ShouldFlushForTextureMutation(tex, m_flushing))
+		FlushDeferredDrawsImpl(GSFlushCause::TextureMutation);
+}
+
+bool GSDevice::DeferredDrawsWouldObserve(const GSTexture* tex) const
+{
+	return m_pass_scheduler->ShouldFlushForTextureMutation(tex, m_flushing);
+}
+
+#if defined(EMUCOREX_ENABLE_NATIVE_SELF_TESTS) && !defined(NDEBUG)
+// Debug-only (EMUCOREX_GS_PASS_TIMING=1): why coalesced draws were emitted, logged by GSDeviceVK as
+// GS_FLUSH_CAUSES every 60 frames. Counts are per flush; "runs" is the render passes the flush produces.
+static const char* const s_flush_cause_names[] = {"other", "not_deferrable", "conflict_raw", "conflict_war", "cap_draws",
+	"cap_bytes", "cap_sampled", "max_runs", "attach_alias", "texture_mutation", "copy", "readback", "present", "pool"};
+static_assert(std::size(s_flush_cause_names) == static_cast<size_t>(GSFlushCause::Count));
+static u64 s_flush_cause_counts[static_cast<size_t>(GSFlushCause::Count)] = {};
+static u64 s_flush_cause_draws[static_cast<size_t>(GSFlushCause::Count)] = {};
+static u64 s_flush_runs_hist[17] = {};
+static u64 s_flush_total = 0, s_flush_draws = 0, s_flush_runs = 0;
+void GSFlushStatsLog(u64 frame)
+{
+	if (s_flush_total == 0)
+		return;
+	std::string causes, draws, hist;
+	for (size_t i = 0; i < static_cast<size_t>(GSFlushCause::Count); i++)
+	{
+		if (s_flush_cause_counts[i] == 0)
+			continue;
+		causes += std::string(" ") + s_flush_cause_names[i] + "=" + std::to_string(s_flush_cause_counts[i]);
+		draws += std::string(" ") + s_flush_cause_names[i] + "=" + std::to_string(s_flush_cause_draws[i] / s_flush_cause_counts[i]);
+	}
+	for (size_t i = 1; i < std::size(s_flush_runs_hist); i++)
+	{
+		if (s_flush_runs_hist[i])
+			hist += " " + std::to_string(i) + ":" + std::to_string(s_flush_runs_hist[i]);
+	}
+	std::fprintf(stderr, "GS_FLUSH_CAUSES frame=%llu flushes=%llu draws=%llu runs=%llu |%s | avg_draws_per_flush%s | runs_per_flush%s\n",
+		static_cast<unsigned long long>(frame), static_cast<unsigned long long>(s_flush_total),
+		static_cast<unsigned long long>(s_flush_draws), static_cast<unsigned long long>(s_flush_runs), causes.c_str(),
+		draws.c_str(), hist.c_str());
+	std::memset(s_flush_cause_counts, 0, sizeof(s_flush_cause_counts));
+	std::memset(s_flush_cause_draws, 0, sizeof(s_flush_cause_draws));
+	std::memset(s_flush_runs_hist, 0, sizeof(s_flush_runs_hist));
+	s_flush_total = s_flush_draws = s_flush_runs = 0;
+}
+#endif
+
+void GSDevice::FlushDeferredDrawsImpl(GSFlushCause cause)
+{
+	pxAssert(!m_flushing);
+#if defined(EMUCOREX_ENABLE_NATIVE_SELF_TESTS) && !defined(NDEBUG)
+	if (g_emucorex_pass_tag_on)
+	{
+		const u32 runs = m_pass_scheduler->GetRunCount();
+		const size_t c = static_cast<size_t>(cause);
+		s_flush_cause_counts[c]++;
+		s_flush_cause_draws[c] += m_pass_scheduler->GetCount();
+		s_flush_runs_hist[std::min<u32>(runs, static_cast<u32>(std::size(s_flush_runs_hist)) - 1)]++;
+		s_flush_total++;
+		s_flush_draws += m_pass_scheduler->GetCount();
+		s_flush_runs += runs;
+	}
+#else
+	(void)cause;
+#endif
+	m_flushing = true;
+	m_pass_scheduler->Emit(this);
+	m_flushing = false;
+	m_deferred_draw_count = 0;
+	if (!m_deferred_recycle.empty())
+	{
+		std::vector<GSTexture*> pending;
+		pending.swap(m_deferred_recycle);
+		for (GSTexture* tex : pending)
+			Recycle(tex);
+	}
+}
+
+void GSDevice::RenderHW(GSHWDrawConfig& config)
+{
+	if (!GSConfig.CoalesceRenderPasses || m_flushing || config.ds_as_rt ||
+		!GSPassScheduler::IsDeferrable(config))
+	{
+		FlushDeferredDraws(GSFlushCause::NotDeferrable);
+		DoRenderHW(config);
+		return;
+	}
+
+	if (m_pass_scheduler->TryEnqueue(config) != GSPassScheduler::Disposition::Queued)
+	{
+		FlushDeferredDraws(m_pass_scheduler->GetLastRefusal());
+		if (m_pass_scheduler->TryEnqueue(config) != GSPassScheduler::Disposition::Queued)
+		{
+			DoRenderHW(config);
+			return;
+		}
+	}
+
+	m_deferred_draw_count = m_pass_scheduler->GetCount();
+}
+
+void GSDevice::DrawMultiStretchRects(
+	const MultiStretchRect* rects, u32 num_rects, GSTexture* dTex, ShaderConvertSelector shader)
+{
+	for (u32 i = 0; i < num_rects; i++)
+	{
+		const MultiStretchRect& sr = rects[i];
+		g_gs_device->StretchRect(sr.src, sr.src_rect, dTex, sr.dst_rect,
+			shader.SetMask(rects[0].wmask.wrgba).SetFilter(sr.filter), sr.filter);
+	}
+}
+
+void GSDevice::SortMultiStretchRects(MultiStretchRect* rects, u32 num_rects)
+{
+	// Depending on num_rects, insertion sort may be better here.
+	std::sort(rects, rects + num_rects, [](const MultiStretchRect& lhs, const MultiStretchRect& rhs) {
+		// Sort source first; filter only breaks ties within a source group.
+		if (lhs.src != rhs.src)
+			return std::less<GSTexture*>{}(lhs.src, rhs.src);
+		return lhs.filter < rhs.filter;
+	});
+}
+
+void GSDevice::ClearCurrent()
+{
+	FlushDeferredDraws(GSFlushCause::Present);
+	m_current = nullptr;
+
+	delete m_merge;
+	delete m_weavebob;
+	delete m_blend;
+	delete m_mad;
+	delete m_target_tmp;
+	delete m_cas;
+	delete m_fsr1_easu;delete m_fsr1_output;delete m_sgsr_output;
+
+	m_merge = nullptr;
+	m_weavebob = nullptr;
+	m_blend = nullptr;
+	m_mad = nullptr;
+	m_target_tmp = nullptr;
+	m_cas = nullptr;
+	m_fsr1_easu=m_fsr1_output=m_sgsr_output=nullptr;
+}
+
+void GSDevice::Merge(GSTexture* sTex[3], GSVector4* sRect, GSVector4* dRect, const GSVector2i& fs, const GSRegPMODE& PMODE, const GSRegEXTBUF& EXTBUF, u32 c)
+{
+	Merge(sTex, sRect, dRect, nullptr, fs, PMODE, EXTBUF, c);
+}
+
+void GSDevice::Merge(GSTexture* sTex[3], GSVector4* sRect, GSVector4* dRect, const MergeTopBand* top_band, const GSVector2i& fs, const GSRegPMODE& PMODE, const GSRegEXTBUF& EXTBUF, u32 c)
+{
+	FlushDeferredDraws(GSFlushCause::Present);
+	if (ResizeRenderTarget(&m_merge, fs.x, fs.y, false, false))
+		DoMerge(sTex, sRect, m_merge, dRect, top_band, PMODE, EXTBUF, c, BilnIf(GSConfig.PCRTCOffsets));
+
+	m_current = m_merge;
+}
+
+void GSDevice::Interlace(const GSVector2i& ds, int field, int mode, float yoffset)
+{
+	Interlace(ds, field, mode, yoffset, {});
+}
+
+void GSDevice::Interlace(const GSVector2i& ds, int field, int mode, float yoffset, const GSFieldPadRows& top_pad, float line_rows, float line_origin)
+{
+	FlushDeferredDraws(GSFlushCause::Present);
+	static int bufIdx = 0;
+	float offset = yoffset * static_cast<float>(field);
+	offset = GSConfig.DisableInterlaceOffset ? 0.0f : offset;
+
+	auto do_interlace = [this, top_pad, line_rows, line_origin](GSTexture* sTex, GSTexture* dTex, ShaderInterlace shader, Filter filter, float yoffset, int bufIdx) {
+		const GSVector2i ds_i = dTex->GetSize();
+		const GSVector2 ds = GSVector2(static_cast<float>(ds_i.x), static_cast<float>(ds_i.y));
+
+		GSVector4 sRect = GSVector4(0.0f, 0.0f, 1.0f, 1.0f);
+		GSVector4 dRect = GSVector4(0.0f, yoffset, ds.x, ds.y + yoffset);
+
+		// Select the top or bottom half for MAD buffering.
+		if (shader == ShaderInterlace::MAD_BUFFER)
+		{
+			const float half_size = ds.y * 0.5f;
+			if ((bufIdx >> 1) == 1)
+				dRect.y += half_size;
+			else
+				dRect.w -= half_size;
+		}
+
+		const InterlaceConstantBuffer cb = {
+			GSVector4(static_cast<float>(bufIdx), 1.0f / ds.y, ds.y, MAD_SENSITIVITY),
+			GSVector4(top_pad.first, top_pad.end, line_rows, line_origin)
+		};
+
+		GL_PUSH("DoInterlace %dx%d Shader:%d Filter:%d", ds_i.x, ds_i.y, static_cast<int>(shader), filter);
+		DoInterlace(sTex, sRect, dTex, dRect, shader, filter, cb);
+	};
+
+	switch (mode)
+	{
+		case 0: // Weave
+			ResizeRenderTarget(&m_weavebob, ds.x, ds.y, true, false);
+			do_interlace(m_merge, m_weavebob, ShaderInterlace::WEAVE, Nearest, offset, field);
+			m_current = m_weavebob;
+			break;
+		case 1: // Bob
+			// Field is reversed here as we are countering the bounce.
+			ResizeRenderTarget(&m_weavebob, ds.x, ds.y, true, false);
+			do_interlace(m_merge, m_weavebob, ShaderInterlace::BOB, Biln, yoffset * (1 - field), 0);
+			m_current = m_weavebob;
+			break;
+		case 2: // Blend
+			ResizeRenderTarget(&m_weavebob, ds.x, ds.y, true, false);
+			do_interlace(m_merge, m_weavebob, ShaderInterlace::WEAVE, Nearest, offset, field);
+			ResizeRenderTarget(&m_blend, ds.x, ds.y, true, false);
+			do_interlace(m_weavebob, m_blend, ShaderInterlace::BLEND, Biln, 0, 0);
+			m_current = m_blend;
+			break;
+		case 3: // FastMAD Motion Adaptive Deinterlacing
+			bufIdx++;
+			bufIdx &= ~1;
+			bufIdx |= field;
+			bufIdx &= 3;
+			ResizeRenderTarget(&m_mad, ds.x, ds.y * 2.0f, true, false);
+			do_interlace(m_merge, m_mad, ShaderInterlace::MAD_BUFFER, Nearest, offset, bufIdx);
+			ResizeRenderTarget(&m_weavebob, ds.x, ds.y, true, false);
+			do_interlace(m_mad, m_weavebob, ShaderInterlace::MAD_RECONSTRUCT, Nearest, 0, bufIdx);
+			m_current = m_weavebob;
+			break;
+        case 4: // Comb-adaptive woven video, in the circuit's native lines.
+            ResizeRenderTarget(&m_weavebob, ds.x, ds.y, true, false);
+            do_interlace(m_merge, m_weavebob, ShaderInterlace::COMB, Nearest, 0.0f, field);
+            m_current = m_weavebob;
+            break;
+		default:
+			m_current = m_merge;
+			break;
+	}
+}
+
+void GSDevice::FXAA()
+{
+	// Combining FXAA+ShadeBoost can't share the same target.
+	GSTexture*& dTex = (m_current == m_target_tmp) ? m_merge : m_target_tmp;
+	if (ResizeRenderTarget(&dTex, m_current->GetWidth(), m_current->GetHeight(), false, false))
+	{
+		DoFXAA(m_current, dTex);
+		m_current = dTex;
+	}
+}
+
+bool GSDevice::ApplyShaderChain(const GSVector2i& output_size)
+{
+	// Guarded here rather than in the backends so a device that never overrides
+	// DoApplyShaderChain (software, or a build without librashader) costs nothing.
+	if (!GSConfig.ShaderChainEnabled || GSConfig.ShaderChainPreset.empty() || !m_current)
+		return false;
+
+	// A minimised or mid-resize window yields a degenerate rect; never build a 0-sized target.
+	if (output_size.x <= 0 || output_size.y <= 0)
+		return false;
+
+	// Same ping-pong as FXAA: the chain reads m_current, so it can't also write it. Unlike FXAA
+	// the target is sized to the caller's on-screen rect rather than to m_current — see the
+	// header for why that has to be the aspect-corrected rect and not the window.
+	GSTexture*& dTex = (m_current == m_target_tmp) ? m_merge : m_target_tmp;
+	if (!ResizeRenderTarget(&dTex, output_size.x, output_size.y, false, false))
+		return false;
+
+	// Only swap on success — a failed chain (bad preset, unsupported backend) must leave
+	// m_current pointing at the unshaded frame rather than at a target nothing rendered to.
+	if (!DoApplyShaderChain(m_current, dTex))
+		return false;
+
+	m_current = dTex;
+	return true;
+}
+
+void GSDevice::ShadeBoost()
+{
+	if (ResizeRenderTarget(&m_target_tmp, m_current->GetWidth(), m_current->GetHeight(), false, false))
+	{
+		// predivide to avoid the divide (multiply) in the shader
+		const GSVector4 params(
+			static_cast<float>(GSConfig.ShadeBoost_Brightness) * (1.0f / 50.0f),
+			static_cast<float>(GSConfig.ShadeBoost_Contrast) * (1.0f / 50.0f),
+			static_cast<float>(GSConfig.ShadeBoost_Saturation) * (1.0f / 50.0f),
+			static_cast<float>(GSConfig.ShadeBoost_Gamma) * (1.0f / 50.0f));
+
+		DoShadeBoost(m_current, m_target_tmp, params.v);
+
+		m_current = m_target_tmp;
+	}
+}
+
+void GSDevice::Resize(int width, int height)
+{
+	GSTexture*& dTex = (m_current == m_target_tmp) ? m_merge : m_target_tmp;
+	GSVector2i s = m_current->GetSize();
+	int multiplier = 1;
+
+	if ((width > s.x || height > s.y))
+	{
+		while (width > s.x || height > s.y)
+		{
+			s = m_current->GetSize() * GSVector2i(++multiplier);
+		}
+	}
+	else
+		s = GSVector2i(width, height);
+
+	if (ResizeRenderTarget(&dTex, s.x, s.y, false, false))
+	{
+		const GSVector4 sRect(0, 0, 1, 1);
+		const GSVector4 dRect(0, 0, s.x, s.y);
+		StretchRectAuto(m_current, sRect, dTex, dRect, Nearest);
+		m_current = dTex;
+	}
+}
+
+bool GSDevice::ResizeRenderTarget(GSTexture** t, int w, int h, bool preserve_contents, bool recycle)
+{
+	pxAssert(t);
+
+	GSTexture* orig_tex = *t;
+	if (orig_tex && orig_tex->GetWidth() == w && orig_tex->GetHeight() == h)
+	{
+		if (!preserve_contents)
+			InvalidateRenderTarget(orig_tex);
+
+		return true;
+	}
+
+	const GSTexture::Format fmt = orig_tex ? orig_tex->GetFormat() : GSTexture::Format::Color;
+	const GSTexture::Usage usage = orig_tex ? orig_tex->GetUsage() : GSTexture::RenderTarget;
+	const bool really_preserve_contents = (preserve_contents && orig_tex);
+	GSTexture* new_tex = FetchSurface(usage, w, h, 1, fmt, !really_preserve_contents, false);
+	if (!new_tex)
+	{
+		Console.WriteLn("%dx%d texture allocation failed in ResizeTexture()", w, h);
+		return false;
+	}
+
+	if (really_preserve_contents)
+	{
+		constexpr GSVector4 sRect = GSVector4::cxpr(0, 0, 1, 1);
+		const GSVector4 dRect = GSVector4(orig_tex->GetRect());
+		StretchRect(orig_tex, sRect, new_tex, dRect, ShaderConvert::COPY, Biln);
+	}
+
+	if (orig_tex)
+	{
+		if (recycle)
+			Recycle(orig_tex);
+		else
+			delete orig_tex;
+	}
+
+	*t = new_tex;
+	return true;
+}
+
+#if defined(__clang__)
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wunused-function"
+#pragma clang diagnostic ignored "-Wignored-qualifiers"
+#elif defined(__GNUC__)
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wignored-qualifiers"
+#endif
+
+// Kinda grotty, but better than copy/pasting the relevant bits in..
+#define A_CPU 1
+#include "bin/resources/shaders/common/ffx_a.h"
+#include "bin/resources/shaders/common/ffx_cas.h"
+#include "bin/resources/shaders/common/ffx_fsr1.h"
+
+#if defined(__clang__)
+#pragma clang diagnostic pop
+#elif defined(__GNUC__)
+#pragma GCC diagnostic pop
+#endif
+
+bool GSDevice::GetCASShaderSource(std::string* source)
+{
+	std::optional<std::string> ffx_a_source = ReadShaderSource("shaders/common/ffx_a.h");
+	std::optional<std::string> ffx_cas_source = ReadShaderSource("shaders/common/ffx_cas.h");
+	if (!ffx_a_source.has_value() || !ffx_cas_source.has_value())
+		return false;
+
+	// Since our shader compilers don't support includes, and OpenGL doesn't at all... we'll do a really cheeky string replace.
+	StringUtil::ReplaceAll(source, "#include \"ffx_a.h\"", ffx_a_source.value());
+	StringUtil::ReplaceAll(source, "#include \"ffx_cas.h\"", ffx_cas_source.value());
+	return true;
+}
+
+void GSDevice::CAS(GSTexture*& tex, GSVector4i& src_rect, GSVector4& src_uv, const GSVector4& draw_rect, bool sharpen_only)
+{
+	const int dst_width = sharpen_only ? src_rect.width() : static_cast<int>(std::ceil(draw_rect.z - draw_rect.x));
+	const int dst_height = sharpen_only ? src_rect.height() : static_cast<int>(std::ceil(draw_rect.w - draw_rect.y));
+	const int src_offset_x = static_cast<int>(src_rect.x);
+	const int src_offset_y = static_cast<int>(src_rect.y);
+
+	GSTexture* src_tex = tex;
+	if (!m_cas || m_cas->GetWidth() != dst_width || m_cas->GetHeight() != dst_height)
+	{
+		delete m_cas;
+		m_cas = CreateSurface(GSTexture::ShaderWriteTexture, dst_width, dst_height, 1, GSTexture::Format::Color);
+		if (!m_cas)
+		{
+			Console.Error("Failed to allocate CAS RW texture.");
+			return;
+		}
+	}
+
+	std::array<u32, NUM_CAS_CONSTANTS> consts;
+	CasSetup(&consts[0], &consts[4], static_cast<float>(GSConfig.CAS_Sharpness) * 0.01f,
+		static_cast<AF1>(src_rect.width()), static_cast<AF1>(src_rect.height()),
+		static_cast<AF1>(dst_width), static_cast<AF1>(dst_height));
+	consts[8] = static_cast<u32>(src_offset_x);
+	consts[9] = static_cast<u32>(src_offset_y);
+
+	if (!DoCAS(src_tex, m_cas, sharpen_only, consts))
+	{
+		// leave textures intact if we failed
+		Console.Warning("Applying CAS failed.");
+		return;
+	}
+
+	tex = m_cas;
+	src_rect = GSVector4i(0, 0, dst_width, dst_height);
+	src_uv = GSVector4(0.0f, 0.0f, 1.0f, 1.0f);
+}
+
+bool GSHWDrawConfig::BlendState::IsEffective(ColorMaskSelector colormask) const
+{
+	return enable && (((colormask.key & 7u) && (src_factor != GSDevice::CONST_ONE || dst_factor != GSDevice::CONST_ZERO)) ||
+						 ((colormask.key & 8u) && (src_factor_alpha != GSDevice::CONST_ONE || dst_factor_alpha != GSDevice::CONST_ZERO)));
+}
+
+std::string GSHWDrawConfig::GetTopologyName(u32 topology)
+{
+	switch (static_cast<GSHWDrawConfig::Topology>(topology))
+	{
+		case GSHWDrawConfig::Topology::Point: return "Point";
+		case GSHWDrawConfig::Topology::Line: return "Line";
+		case GSHWDrawConfig::Topology::Triangle: return "Triangle";
+		default: return std::to_string(topology);
+	}
+}
+
+std::string GSHWDrawConfig::GetVSExpandName(u32 vsexpand)
+{
+	switch (static_cast<GSHWDrawConfig::VSExpand>(vsexpand))
+	{
+		case GSHWDrawConfig::VSExpand::None: return "None";
+		case GSHWDrawConfig::VSExpand::Point: return "Point";
+		case GSHWDrawConfig::VSExpand::Line: return "Line";
+		case GSHWDrawConfig::VSExpand::Sprite: return "Sprite";
+		default: return std::to_string(vsexpand);
+	}
+}
+
+std::string GSHWDrawConfig::GetPSDateName(u32 date)
+{
+	switch (date)
+	{
+		case 0: return "None";
+		case 1: return "0_pass_PrimID_init";
+		case 2: return "1_pass_PrimID_init";
+		case 3: return "PrimID_main";
+		case 5: return "0_pass_main";
+		case 6: return "1_pass_main";
+		default: return std::to_string(date);
+	}
+}
+
+std::string GSHWDrawConfig::GetPSAlphaTestName(u32 atst)
+{
+	switch (static_cast<GSHWDrawConfig::PS_ATST>(atst))
+	{
+		case GSHWDrawConfig::PS_ATST::NONE: return "NONE";
+		case GSHWDrawConfig::PS_ATST::LEQUAL: return "LEQUAL";
+		case GSHWDrawConfig::PS_ATST::GEQUAL: return "GEQUAL";
+		case GSHWDrawConfig::PS_ATST::EQUAL: return "EQUAL";
+		case GSHWDrawConfig::PS_ATST::NOTEQUAL: return "NOTEQUAL";
+		default: return std::to_string(atst);
+	};
+}
+
+std::string GSHWDrawConfig::GetPSDstFmtName(u32 dstfmt)
+{
+	switch (dstfmt)
+	{
+		case 0: return "32bit";
+		case 1: return "24bit";
+		case 2: return "16bit";
+		default: return std::to_string(dstfmt);
+	}
+}
+
+std::string GSHWDrawConfig::GetPSDepthFmtName(u32 depthfmt)
+{
+	switch (depthfmt)
+	{
+		case 0: return "None";
+		case 1: return "32bit";
+		case 2: return "16bit";
+		case 3: return "RGBA";
+		default: return std::to_string(depthfmt);
+	}
+}
+
+std::string GSHWDrawConfig::GetPSBlendABDName(u32 abd)
+{
+	switch (abd)
+	{
+		case 0: return "Cs";
+		case 1: return "Cd";
+		case 2: return "Zero";
+		default: return std::to_string(abd);
+	}
+}
+
+std::string GSHWDrawConfig::GetPSBlendCName(u32 c)
+{
+	switch (c)
+	{
+		case 0: return "As";
+		case 1: return "Ad";
+		case 2: return "Af";
+		default: return std::to_string(c);
+	}
+}
+
+std::string GSHWDrawConfig::GetPSBlendHWName(u32 blendhw)
+{
+	switch (static_cast<HWBlendType>(blendhw))
+	{
+		case HWBlendType::SRC_ONE_DST_FACTOR: return "SRC_ONE_DST_FACTOR";
+		case HWBlendType::SRC_ALPHA_DST_FACTOR: return "SRC_ALPHA_DST_FACTOR";
+		case HWBlendType::SRC_DOUBLE: return "SRC_DOUBLE";
+		case HWBlendType::SRC_HALF_ONE_DST_FACTOR: return "SRC_HALF_ONE_DST_FACTOR";
+		case HWBlendType::SRC_INV_DST_BLEND_HALF: return "SRC_INV_DST_BLEND_HALF";
+		case HWBlendType::INV_SRC_DST_BLEND_HALF: return "INV_SRC_DST_BLEND_HALF";
+		default: return std::to_string(blendhw);
+	}
+}
+
+std::string GSHWDrawConfig::GetPSBlendMixName(u32 blendmix)
+{
+	switch (static_cast<HWBlendType>(blendmix))
+	{
+		case HWBlendType::BMIX1_ALPHA_HIGH_ONE: return "BMIX1_ALPHA_HIGH_ONE";
+		case HWBlendType::BMIX1_SRC_HALF: return "BMIX1_SRC_HALF";
+		case HWBlendType::BMIX2_OVERFLOW: return "BMIX2_OVERFLOW";
+		default: return std::to_string(blendmix);
+	}
+}
+
+std::string GSHWDrawConfig::GetPSChannelName(u32 channel)
+{
+	switch (channel)
+	{
+		case 0: return "None";
+		case 1: return "FetchRed";
+		case 2: return "FetchGreen";
+		case 3: return "FetchBlue";
+		case 4: return "FetchAlpha";
+		case 5: return "FetchRGB";
+		case 6: return "FetchGXBY";
+		default: return std::to_string(channel);
+	}
+}
+
+std::string GSHWDrawConfig::GetPSDitherName(u32 dither)
+{
+	switch (dither)
+	{
+		case 0: return "None";
+		case 1: return "Standard";
+		case 2: return "ReciprocalScaled";
+		default: return std::to_string(dither);
+	}
+}
+
+std::string GSHWDrawConfig::GetSSTrilnName(u32 triln)
+{
+	switch (static_cast<GS_MIN_FILTER>(triln))
+	{
+		case GS_MIN_FILTER::Nearest: return "Nearest";
+		case GS_MIN_FILTER::Linear: return "Linear";
+		case GS_MIN_FILTER::Nearest_Mipmap_Nearest: return "Nearest_Mipmap_Nearest";
+		case GS_MIN_FILTER::Nearest_Mipmap_Linear: return "Nearest_Mipmap_Linear";
+		case GS_MIN_FILTER::Linear_Mipmap_Nearest: return "Linear_Mipmap_Nearest";
+		case GS_MIN_FILTER::Linear_Mipmap_Linear: return "Linear_Mipmap_Linear";
+		default: return std::to_string(triln);
+	}
+}
+
+std::string GSHWDrawConfig::GetBlendOpName(u32 blendop)
+{
+	switch (blendop)
+	{
+		case 0: return "ADD";
+		case 1: return "SUBTRACT";
+		case 2: return "REVERSE_SUBTRACT";
+		default: return std::to_string(blendop);
+	}
+}
+
+std::string GSHWDrawConfig::GetBlendFactorName(u32 blendfactor)
+{
+	switch (blendfactor)
+	{
+		case 0: return "SRC_COLOR";
+		case 1: return "ONE_MINUS_SRC_COLOR";
+		case 2: return "DST_COLOR";
+		case 3: return "ONE_MINUS_DST_COLOR";
+		case 4: return "SRC1_COLOR";
+		case 5: return "ONE_MINUS_SRC1_COLOR";
+		case 6: return "SRC_ALPHA";
+		case 7: return "ONE_MINUS_SRC_ALPHA";
+		case 8: return "DST_ALPHA";
+		case 9: return "ONE_MINUS_DST_ALPHA";
+		case 10: return "SRC1_ALPHA";
+		case 11: return "ONE_MINUS_SRC1_ALPHA";
+		case 12: return "CONSTANT_COLOR";
+		case 13: return "ONE_MINUS_CONSTANT_COLOR";
+		case 14: return "ONE";
+		case 15: return "ZERO";
+		default: return std::to_string(blendfactor);
+	}
+}
+
+std::string GSHWDrawConfig::GetDestinationAlphaModeName(u32 datm)
+{
+	switch (static_cast<GSHWDrawConfig::DestinationAlphaMode>(datm))
+	{
+		case GSHWDrawConfig::DestinationAlphaMode::Off: return "Off";
+		case GSHWDrawConfig::DestinationAlphaMode::Stencil: return "Stencil";
+		case GSHWDrawConfig::DestinationAlphaMode::StencilOne: return "StencilOne";
+		case GSHWDrawConfig::DestinationAlphaMode::PrimIDTracking: return "PrimIDTracking";
+		case GSHWDrawConfig::DestinationAlphaMode::Full: return "Full";
+		default: return std::to_string(datm);
+	}
+}
+
+std::string GSHWDrawConfig::GetColClipModeName(u32 ccmode)
+{
+	switch (static_cast<GSHWDrawConfig::ColClipMode>(ccmode))
+	{
+		case GSHWDrawConfig::ColClipMode::NoModify: return "NoModify";
+		case GSHWDrawConfig::ColClipMode::ConvertOnly: return "ConvertOnly";
+		case GSHWDrawConfig::ColClipMode::ResolveOnly: return "ResolveOnly";
+		case GSHWDrawConfig::ColClipMode::ConvertAndResolve: return "ConvertAndResolve";
+		case GSHWDrawConfig::ColClipMode::EarlyResolve: return "EarlyResolve";
+		default: return std::to_string(ccmode);
+	}
+}
+
+std::string GSHWDrawConfig::GetSetDATMName(u32 datm)
+{
+	switch (static_cast<SetDATM>(datm))
+	{
+		case SetDATM::DATM0: return "DATM0";
+		case SetDATM::DATM1: return "DATM1";
+		case SetDATM::DATM0_RTA_CORRECTION: return "DATM0_RTA_CORRECTION";
+		case SetDATM::DATM1_RTA_CORRECTION: return "DATM1_RTA_CORRECTION";
+		default: return std::to_string(datm);
+	};
+}
+
+#ifndef EMUCOREX_DISABLE_GS_DIAGNOSTICS
+static constexpr const char* INDENT = "  ";
+
+void GSHWDrawConfig::DumpPSSelector(std::ostream& out, const PSSelector& ps, const std::string& indent)
+{
+	out.imbue(std::locale::classic()); // Disable integer separators
+	out << std::dec;
+
+	out << indent << "aem_fmt: " << static_cast<u32>(ps.aem_fmt) << std::endl;
+	out << indent << "pal_fmt: " << static_cast<u32>(ps.pal_fmt) << std::endl;
+	out << indent << "dst_fmt: " << static_cast<u32>(ps.dst_fmt) << " # " << GetPSDstFmtName(static_cast<u32>(ps.dst_fmt)) << std::endl;
+	out << indent << "depth_fmt: " << static_cast<u32>(ps.depth_fmt) << " # " << GetPSDepthFmtName(static_cast<u32>(ps.depth_fmt)) << std::endl;
+	out << indent << "aem: " << static_cast<u32>(ps.aem) << std::endl;
+	out << indent << "fba: " << static_cast<u32>(ps.fba) << std::endl;
+	out << indent << "fog: " << static_cast<u32>(ps.fog) << std::endl;
+	out << indent << "iip: " << static_cast<u32>(ps.iip) << std::endl;
+	out << indent << "date: " << static_cast<u32>(ps.date) << " # " << GetPSDateName(static_cast<u32>(ps.date)) << std::endl;
+	out << indent << "atst: " << static_cast<u32>(ps.atst) << " # " << GetPSAlphaTestName(static_cast<u32>(ps.atst)) << std::endl;
+	out << indent << "afail: " << static_cast<u32>(ps.afail) << " # " << GSUtil::GetAFAILName(static_cast<u32>(ps.afail)) << std::endl;
+	out << indent << "fst: " << static_cast<u32>(ps.fst) << std::endl;
+	out << indent << "tfx: " << static_cast<u32>(ps.tfx) << std::endl;
+	out << indent << "tcc: " << GSUtil::GetTCCName(static_cast<u32>(ps.tcc)) << std::endl;
+	out << indent << "wms: " << static_cast<u32>(ps.wms) << " # " << static_cast<u32>(ps.wms) << std::endl;
+	out << indent << "wmt: " << static_cast<u32>(ps.wmt) << std::endl;
+	out << indent << "adjs: " << static_cast<u32>(ps.adjs) << std::endl;
+	out << indent << "adjt: " << static_cast<u32>(ps.adjt) << std::endl;
+	out << indent << "ltf: " << static_cast<u32>(ps.ltf) << std::endl;
+	out << indent << "shuffle: " << static_cast<u32>(ps.shuffle) << std::endl;
+	out << indent << "shuffle_same: " << static_cast<u32>(ps.shuffle_same) << std::endl;
+	out << indent << "real16src: " << static_cast<u32>(ps.real16src) << std::endl;
+	out << indent << "process_ba: " << static_cast<u32>(ps.process_ba) << std::endl;
+	out << indent << "process_rg: " << static_cast<u32>(ps.process_rg) << std::endl;
+	out << indent << "shuffle_across: " << static_cast<u32>(ps.shuffle_across) << std::endl;
+	out << indent << "write_rg: " << static_cast<u32>(ps.write_rg) << std::endl;
+	out << indent << "fbmask: " << static_cast<u32>(ps.fbmask) << std::endl;
+	out << indent << "quantize_color: " << static_cast<u32>(ps.quantize_color) << std::endl;
+	out << indent << "substitute_alpha: " << static_cast<u32>(ps.substitute_alpha) << std::endl;
+	out << indent << "blend_a: " << static_cast<u32>(ps.blend_a) << " # " << GetPSBlendABDName(static_cast<u32>(ps.blend_a)) << std::endl;
+	out << indent << "blend_b: " << static_cast<u32>(ps.blend_b) << " # " << GetPSBlendABDName(static_cast<u32>(ps.blend_b)) << std::endl;
+	out << indent << "blend_c: " << static_cast<u32>(ps.blend_c) << " # " << GetPSBlendCName(static_cast<u32>(ps.blend_c)) << std::endl;
+	out << indent << "blend_d: " << static_cast<u32>(ps.blend_d) << " # " << GetPSBlendABDName(static_cast<u32>(ps.blend_d)) << std::endl;
+	out << indent << "fixed_one_a: " << static_cast<u32>(ps.fixed_one_a) << std::endl;
+	out << indent << "blend_hw: " << static_cast<u32>(ps.blend_hw) << " # " << GetPSBlendHWName(static_cast<u32>(ps.blend_hw)) << std::endl;
+	out << indent << "a_masked: " << static_cast<u32>(ps.a_masked) << std::endl;
+	out << indent << "colclip_hw: " << static_cast<u32>(ps.colclip_hw) << std::endl;
+	out << indent << "rta_correction: " << static_cast<u32>(ps.rta_correction) << std::endl;
+	out << indent << "rta_source_correction: " << static_cast<u32>(ps.rta_source_correction) << std::endl;
+	out << indent << "colclip: " << static_cast<u32>(ps.colclip) << std::endl;
+	out << indent << "blend_mix: " << static_cast<u32>(ps.blend_mix) << " # " << GetPSBlendMixName(static_cast<u32>(ps.blend_mix)) << std::endl;
+	out << indent << "round_inv: " << static_cast<u32>(ps.round_inv) << std::endl;
+	out << indent << "pabe: " << static_cast<u32>(ps.pabe) << std::endl;
+	out << indent << "no_color: " << static_cast<u32>(ps.no_color) << std::endl;
+	out << indent << "no_color1: " << static_cast<u32>(ps.no_color1) << std::endl;
+	out << indent << "channel: " << static_cast<u32>(ps.channel) << " # " << GetPSChannelName(static_cast<u32>(ps.channel)) << std::endl;
+	out << indent << "dither: " << static_cast<u32>(ps.dither) << " # " << GetPSDitherName(static_cast<u32>(ps.dither)) << std::endl;
+	out << indent << "dither_adjust: " << static_cast<u32>(ps.dither_adjust) << std::endl;
+	out << indent << "zclamp: " << static_cast<u32>(ps.zclamp) << std::endl;
+	out << indent << "tcoffsethack: " << static_cast<u32>(ps.tcoffsethack) << std::endl;
+	out << indent << "urban_chaos_hle: " << static_cast<u32>(ps.urban_chaos_hle) << std::endl;
+	out << indent << "tales_of_abyss_hle: " << static_cast<u32>(ps.tales_of_abyss_hle) << std::endl;
+	out << indent << "tex_is_fb: " << static_cast<u32>(ps.tex_is_fb) << std::endl;
+	out << indent << "automatic_lod: " << static_cast<u32>(ps.automatic_lod) << std::endl;
+	out << indent << "manual_lod: " << static_cast<u32>(ps.manual_lod) << std::endl;
+	out << indent << "point_sampler: " << static_cast<u32>(ps.point_sampler) << std::endl;
+	out << indent << "region_rect: " << static_cast<u32>(ps.region_rect) << std::endl;
+	out << indent << "scanmsk: " << static_cast<u32>(ps.scanmsk) << " # " << GSUtil::GetSCANMSKName(static_cast<u32>(ps.scanmsk)) << std::endl;
+}
+
+void GSHWDrawConfig::DumpVSSelector(std::ostream& out, const VSSelector& vs, const std::string& indent)
+{
+	out.imbue(std::locale::classic()); // Disable integer separators
+	out << std::dec;
+
+	out << indent << "fst: " << static_cast<u32>(vs.fst) << std::endl;
+	out << indent << "tme: " << static_cast<u32>(vs.tme) << std::endl;
+	out << indent << "iip: " << static_cast<u32>(vs.iip) << std::endl;
+	out << indent << "point_size: " << static_cast<u32>(vs.point_size) << std::endl;
+	out << indent << "expand: " << static_cast<u32>(vs.expand) << " # " << GetVSExpandName(static_cast<u32>(vs.expand)) << std::endl;
+}
+
+void GSHWDrawConfig::DumpBlendState(std::ostream& out, const BlendState& bs, const std::string& indent)
+{
+	out.imbue(std::locale::classic()); // Disable integer separators
+	out << std::dec;
+
+	out << indent << "enable: " << static_cast<u32>(bs.enable) << std::endl;
+	out << indent << "constant_enable: " << static_cast<u32>(bs.constant_enable) << std::endl;
+	out << indent << "op: " << static_cast<u32>(bs.op) << " # " << GetBlendOpName(static_cast<u32>(bs.op)) << std::endl;
+	out << indent << "src_factor: " << static_cast<u32>(bs.src_factor) << " # " << GetBlendFactorName(static_cast<u32>(bs.src_factor)) << std::endl;
+	out << indent << "dst_factor: " << static_cast<u32>(bs.dst_factor) << " # " << GetBlendFactorName(static_cast<u32>(bs.dst_factor)) << std::endl;
+	out << indent << "src_factor_alpha: " << static_cast<u32>(bs.src_factor_alpha) << " # " << GetBlendFactorName(static_cast<u32>(bs.src_factor_alpha)) << std::endl;
+	out << indent << "dst_factor_alpha: " << static_cast<u32>(bs.dst_factor_alpha) << " # " << GetBlendFactorName(static_cast<u32>(bs.dst_factor_alpha)) << std::endl;
+	out << indent << "constant: " << static_cast<u32>(bs.constant) << std::endl;
+}
+
+void GSHWDrawConfig::DumpDepthStencilSelctor(std::ostream& out, const DepthStencilSelector& dss, const std::string& indent)
+{
+	out.imbue(std::locale::classic()); // Disable integer separators
+	out << std::dec;
+
+	out << indent << "ztst: " << static_cast<u32>(dss.ztst) << " # " << GSUtil::GetZTSTName(static_cast<u32>(dss.ztst)) << std::endl;
+	out << indent << "zwe: " << static_cast<u32>(dss.zwe) << std::endl;
+	out << indent << "date: " << static_cast<u32>(dss.date) << std::endl;
+	out << indent << "date_one: " << static_cast<u32>(dss.date_one) << std::endl;
+}
+
+void GSHWDrawConfig::DumpSamplerSelector(std::ostream& out, const SamplerSelector& ss, const std::string& indent)
+{
+	out.imbue(std::locale::classic()); // Disable integer separators
+	out << std::dec;
+
+	out << indent << "tau: " << static_cast<u32>(ss.tau) << std::endl;
+	out << indent << "tav: " << static_cast<u32>(ss.tav) << std::endl;
+	out << indent << "biln: " << static_cast<u32>(ss.biln) << std::endl;
+	out << indent << "triln: " << static_cast<u32>(ss.triln) << " # " << GetSSTrilnName(static_cast<u32>(ss.triln)) << std::endl;
+	out << indent << "aniso: " << static_cast<u32>(ss.aniso) << std::endl;
+	out << indent << "lodclamp: " << static_cast<u32>(ss.lodclamp) << std::endl;
+}
+
+void GSHWDrawConfig::DumpAlphaPass(std::ostream& out, const AlphaPass& ap, const std::string& indent)
+{
+	out.imbue(std::locale::classic()); // Disable integer separators
+	out << std::dec;
+
+	out << indent << "enable: " << static_cast<u32>(ap.enable) << std::endl;
+	out << indent << "require_one_barrier: " << static_cast<u32>(ap.require_one_barrier) << std::endl;
+	out << indent << "require_full_barrier: " << static_cast<u32>(ap.require_full_barrier) << std::endl;
+	out << indent << "colormask: " << std::showbase << std::hex << static_cast<u32>(ap.colormask.wrgba) << std::dec << std::endl;
+	out << indent << "ps_aref: " << static_cast<u32>(ap.ps_aref) << std::endl;
+
+	out << indent << "ps:" << std::endl;
+	DumpPSSelector(out, ap.ps, indent + INDENT);
+
+	out << indent << "dss:" << std::endl;
+	DumpDepthStencilSelctor(out, ap.depth, indent + INDENT);
+}
+
+void GSHWDrawConfig::DumpBlendMultipass(std::ostream& out, const BlendMultiPass& bmp, const std::string& indent)
+{
+	out.imbue(std::locale::classic()); // Disable integer separators
+	out << std::dec;
+
+	out << indent << "enable: " << static_cast<u32>(bmp.enable) << std::endl;
+	out << indent << "no_color1: " << static_cast<u32>(bmp.no_color1) << std::endl;
+	out << indent << "blend_hw: " << static_cast<u32>(bmp.blend_hw) << " # " << GetPSBlendHWName(static_cast<u32>(bmp.blend_hw)) << std::endl;
+	out << indent << "dither: " << static_cast<u32>(bmp.dither) << std::endl;
+
+	out << indent << "blend:" << std::endl;
+	DumpBlendState(out, bmp.blend, indent + INDENT);
+}
+
+void GSHWDrawConfig::DumpConfig(std::ostream& out, const GSHWDrawConfig& conf,
+	bool ps, bool vs, bool bs, bool dss, bool ss, bool asp, bool bmp)
+{
+	out.imbue(std::locale::classic()); // Disable integer separators
+	out << std::dec;
+
+	out << "topology: " << static_cast<u32>(conf.topology) << " # " << GetTopologyName(static_cast<u32>(conf.topology)) << std::endl;
+	out << "require_one_barrier: " << static_cast<u32>(conf.require_one_barrier) << std::endl;
+	out << "require_full_barrier: " << static_cast<u32>(conf.require_full_barrier) << std::endl;
+
+	out << "destination_alpha: " << static_cast<u32>(conf.destination_alpha) << " # " << GetDestinationAlphaModeName(static_cast<u32>(conf.destination_alpha)) << std::endl;
+	out << "datm: " << static_cast<u32>(conf.datm) << " # " << GetSetDATMName(static_cast<u32>(conf.datm)) << std::endl;
+	out << "line_expand: " << conf.line_expand << std::endl;
+	out << "colormask: " << std::hex << std::showbase << static_cast<u32>(conf.colormask.wrgba) << std::dec << std::endl;
+
+	if (ps)
+	{
+		out << "ps:" << std::endl;
+		DumpPSSelector(out, conf.ps, INDENT);
+	}
+
+	if (vs)
+	{
+		out << "vs:" << std::endl;
+		DumpVSSelector(out, conf.vs, INDENT);
+	}
+
+	if (bs)
+	{
+		out << "blend:" << std::endl;
+		DumpBlendState(out, conf.blend, INDENT);
+	}
+
+	if (ss)
+	{
+		out << "sampler:" << std::endl;
+		DumpSamplerSelector(out, conf.sampler, INDENT);
+	}
+
+	if (dss)
+	{
+		out << "depth:" << std::endl;
+		DumpDepthStencilSelctor(out, conf.depth, INDENT);
+	}
+	
+	if (asp)
+	{
+		out << "alpha_second_pass:" << std::endl;
+		DumpAlphaPass(out, conf.alpha_second_pass, INDENT);
+	}
+
+	if (bmp)
+	{
+		out << "blend_multi_pass:" << std::endl;
+		DumpBlendMultipass(out, conf.blend_multi_pass, INDENT);
+	}
+}
+
+void GSHWDrawConfig::DumpConfig(const std::string& fn, const GSHWDrawConfig& conf,
+	bool ps, bool vs, bool bs, bool dss, bool ss, bool asp, bool bmp)
+{
+	std::ofstream file(fn);
+
+	if (!file.is_open())
+		return;
+	
+	DumpConfig(file, conf, ps, vs, bs, dss, ss, asp, bmp);
+}
+
+#endif
+
+static constexpr u32 NUM_REMAP_INPUTS = static_cast<u32>(ShaderConvert::Count) * 4;
+
+static constexpr ShaderConvertSelector GetRemappedShader(u32 idx)
+{
+	ShaderConvert convert = static_cast<ShaderConvert>(idx >> 2);
+	bool depth_out = (idx >> 0) & 1;
+	Filter filter = static_cast<Filter>((idx >> 1) & 1);
+	return ShaderConvertSelector(convert, 0xf, depth_out, filter);
+}
+
+static constexpr bool RemapIndexIsValid(u32 idx)
+{
+	ShaderConvert convert = static_cast<ShaderConvert>(idx >> 2);
+	bool depth_out = (idx >> 0) & 1;
+	Filter filter = static_cast<Filter>((idx >> 1) & 1);
+	if (HasVariableWriteMask(convert) && !depth_out && filter == Nearest)
+		return false; // Handled as variable write mask
+	if (depth_out && !HasFloat32Output(convert))
+		return false;
+	if (filter == Biln && !SupportsBilinear(convert))
+		return false;
+	return true;
+}
+
+static constexpr u32 CalcNumRemappedShaders()
+{
+	u32 num = 0;
+	for (u32 i = 0; i < NUM_REMAP_INPUTS; i++)
+		num += RemapIndexIsValid(i);
+	return num;
+}
+
+static constexpr u32 NUM_REMAPPED_SHADERS = CalcNumRemappedShaders();
+static constexpr u32 NUM_TOTAL_SHADERS = NUM_REMAPPED_SHADERS +
+                                         16 * ShaderConvertSelector::NUM_VARIABLE_WRITE_MASK_SHADERS;
+static_assert(NUM_REMAPPED_SHADERS <= 256); // We use u8 for the remap indices.
+
+static constexpr std::array<u8, NUM_REMAP_INPUTS> GenRemapArray()
+{
+	std::array<u8, NUM_REMAP_INPUTS> out{};
+	u8 out_idx = 0;
+	const u8 invalid = 0xff;
+	for (u32 i = 0; i < NUM_REMAP_INPUTS; i++)
+		out[i] = RemapIndexIsValid(i) ? out_idx++ : invalid;
+	return out;
+}
+
+static constexpr std::array<ShaderConvertSelector, NUM_TOTAL_SHADERS> GetPackedShaders()
+{
+	std::array<ShaderConvertSelector, NUM_TOTAL_SHADERS> out{};
+	u32 append_idx = 0;
+	for (u32 i = 0; i < NUM_REMAP_INPUTS; i++)
+	{
+		if (RemapIndexIsValid(i))
+			out[append_idx++] = GetRemappedShader(i);
+	}
+	for (u32 i = 0; i < 16; i++)
+		out[append_idx++] = ShaderConvertSelector(ShaderConvert::COPY, i);
+	for (u32 i = 0; i < 16; i++)
+		out[append_idx++] = ShaderConvertSelector(ShaderConvert::RTA_CORRECTION, i);
+	return out;
+}
+
+constinit const u32 ShaderConvertSelector::NUM_REMAPPED_SHADERS = ::NUM_REMAPPED_SHADERS;
+constinit const u32 ShaderConvertSelector::NUM_TOTAL_SHADERS = ::NUM_TOTAL_SHADERS;
+constinit const std::array<u8, NUM_REMAP_INPUTS> ShaderConvertSelector::INDEX_REMAP = GenRemapArray();
+static constexpr auto PACKED_SHADERS = GetPackedShaders();
+const std::span<const ShaderConvertSelector> ShaderConvertSelector::SHADERS = PACKED_SHADERS;
+
+// clang-format off
+
+// Maps PS2 blend modes to our best approximation of them with PC hardware
+const std::array<HWBlend, 3*3*3*3> GSDevice::m_blendMap =
+{{
+	{ BLEND_NO_REC             , OP_ADD          , CONST_ONE       , CONST_ZERO}      , // 0000: (Cs - Cs)*As + Cs ==> Cs
+	{ BLEND_CD                 , OP_ADD          , CONST_ZERO      , CONST_ONE}       , // 0001: (Cs - Cs)*As + Cd ==> Cd
+	{ BLEND_NO_REC             , OP_ADD          , CONST_ZERO      , CONST_ZERO}      , // 0002: (Cs - Cs)*As +  0 ==> 0
+	{ BLEND_NO_REC             , OP_ADD          , CONST_ONE       , CONST_ZERO}      , // 0010: (Cs - Cs)*Ad + Cs ==> Cs
+	{ BLEND_CD                 , OP_ADD          , CONST_ZERO      , CONST_ONE}       , // 0011: (Cs - Cs)*Ad + Cd ==> Cd
+	{ BLEND_NO_REC             , OP_ADD          , CONST_ZERO      , CONST_ZERO}      , // 0012: (Cs - Cs)*Ad +  0 ==> 0
+	{ BLEND_NO_REC             , OP_ADD          , CONST_ONE       , CONST_ZERO}      , // 0020: (Cs - Cs)*F  + Cs ==> Cs
+	{ BLEND_CD                 , OP_ADD          , CONST_ZERO      , CONST_ONE}       , // 0021: (Cs - Cs)*F  + Cd ==> Cd
+	{ BLEND_NO_REC             , OP_ADD          , CONST_ZERO      , CONST_ZERO}      , // 0022: (Cs - Cs)*F  +  0 ==> 0
+	{ BLEND_A_MAX | BLEND_MIX2 , OP_SUBTRACT     , CONST_ONE       , SRC1_COLOR}      , // 0100: (Cs - Cd)*As + Cs ==> Cs*(As + 1) - Cd*As
+	{ BLEND_MIX1               , OP_ADD          , SRC1_COLOR      , INV_SRC1_COLOR}  , // 0101: (Cs - Cd)*As + Cd ==> Cs*As + Cd*(1 - As)
+	{ BLEND_MIX1               , OP_SUBTRACT     , SRC1_COLOR      , SRC1_COLOR}      , // 0102: (Cs - Cd)*As +  0 ==> Cs*As - Cd*As
+	{ BLEND_A_MAX              , OP_SUBTRACT     , CONST_ONE       , DST_ALPHA}       , // 0110: (Cs - Cd)*Ad + Cs ==> Cs*(Ad + 1) - Cd*Ad
+	{ 0                        , OP_ADD          , DST_ALPHA       , INV_DST_ALPHA}   , // 0111: (Cs - Cd)*Ad + Cd ==> Cs*Ad + Cd*(1 - Ad)
+	{ BLEND_HW5                , OP_SUBTRACT     , DST_ALPHA       , DST_ALPHA}       , // 0112: (Cs - Cd)*Ad +  0 ==> Cs*Ad - Cd*Ad
+	{ BLEND_A_MAX | BLEND_MIX2 , OP_SUBTRACT     , CONST_ONE       , CONST_COLOR}     , // 0120: (Cs - Cd)*F  + Cs ==> Cs*(F + 1) - Cd*F
+	{ BLEND_MIX1               , OP_ADD          , CONST_COLOR     , INV_CONST_COLOR} , // 0121: (Cs - Cd)*F  + Cd ==> Cs*F + Cd*(1 - F)
+	{ BLEND_MIX1               , OP_SUBTRACT     , CONST_COLOR     , CONST_COLOR}     , // 0122: (Cs - Cd)*F  +  0 ==> Cs*F - Cd*F
+	{ BLEND_NO_REC             , OP_ADD          , CONST_ONE       , CONST_ZERO}      , // 0200: (Cs -  0)*As + Cs ==> Cs*(As + 1)
+	{ BLEND_ACCU               , OP_ADD          , SRC1_COLOR      , CONST_ONE}       , // 0201: (Cs -  0)*As + Cd ==> Cs*As + Cd
+	{ BLEND_NO_REC             , OP_ADD          , SRC1_COLOR      , CONST_ZERO}      , // 0202: (Cs -  0)*As +  0 ==> Cs*As
+	{ BLEND_A_MAX | BLEND_HW8  , OP_ADD          , CONST_ONE       , CONST_ZERO}      , // 0210: (Cs -  0)*Ad + Cs ==> Cs*(Ad + 1)
+	{ BLEND_HW3                , OP_ADD          , DST_ALPHA       , CONST_ONE}       , // 0211: (Cs -  0)*Ad + Cd ==> Cs*Ad + Cd
+	{ BLEND_HW3                , OP_ADD          , DST_ALPHA       , CONST_ZERO}      , // 0212: (Cs -  0)*Ad +  0 ==> Cs*Ad
+	{ BLEND_NO_REC             , OP_ADD          , CONST_ONE       , CONST_ZERO}      , // 0220: (Cs -  0)*F  + Cs ==> Cs*(F + 1)
+	{ BLEND_ACCU               , OP_ADD          , CONST_COLOR     , CONST_ONE}       , // 0221: (Cs -  0)*F  + Cd ==> Cs*F + Cd
+	{ BLEND_NO_REC             , OP_ADD          , CONST_COLOR     , CONST_ZERO}      , // 0222: (Cs -  0)*F  +  0 ==> Cs*F
+	{ BLEND_MIX3               , OP_ADD          , INV_SRC1_COLOR  , SRC1_COLOR}      , // 1000: (Cd - Cs)*As + Cs ==> Cd*As + Cs*(1 - As)
+	{ BLEND_A_MAX | BLEND_MIX1 , OP_REV_SUBTRACT , SRC1_COLOR      , CONST_ONE}       , // 1001: (Cd - Cs)*As + Cd ==> Cd*(As + 1) - Cs*As
+	{ BLEND_MIX1               , OP_REV_SUBTRACT , SRC1_COLOR      , SRC1_COLOR}      , // 1002: (Cd - Cs)*As +  0 ==> Cd*As - Cs*As
+	{ 0                        , OP_ADD          , INV_DST_ALPHA   , DST_ALPHA}       , // 1010: (Cd - Cs)*Ad + Cs ==> Cd*Ad + Cs*(1 - Ad)
+	{ BLEND_A_MAX              , OP_REV_SUBTRACT , DST_ALPHA       , CONST_ONE}       , // 1011: (Cd - Cs)*Ad + Cd ==> Cd*(Ad + 1) - Cs*Ad
+	{ BLEND_HW5                , OP_REV_SUBTRACT , DST_ALPHA       , DST_ALPHA}       , // 1012: (Cd - Cs)*Ad +  0 ==> Cd*Ad - Cs*Ad
+	{ BLEND_MIX3               , OP_ADD          , INV_CONST_COLOR , CONST_COLOR}     , // 1020: (Cd - Cs)*F  + Cs ==> Cd*F + Cs*(1 - F)
+	{ BLEND_A_MAX | BLEND_MIX1 , OP_REV_SUBTRACT , CONST_COLOR     , CONST_ONE}       , // 1021: (Cd - Cs)*F  + Cd ==> Cd*(F + 1) - Cs*F
+	{ BLEND_MIX1               , OP_REV_SUBTRACT , CONST_COLOR     , CONST_COLOR}     , // 1022: (Cd - Cs)*F  +  0 ==> Cd*F - Cs*F
+	{ BLEND_NO_REC             , OP_ADD          , CONST_ONE       , CONST_ZERO}      , // 1100: (Cd - Cd)*As + Cs ==> Cs
+	{ BLEND_CD                 , OP_ADD          , CONST_ZERO      , CONST_ONE}       , // 1101: (Cd - Cd)*As + Cd ==> Cd
+	{ BLEND_NO_REC             , OP_ADD          , CONST_ZERO      , CONST_ZERO}      , // 1102: (Cd - Cd)*As +  0 ==> 0
+	{ BLEND_NO_REC             , OP_ADD          , CONST_ONE       , CONST_ZERO}      , // 1110: (Cd - Cd)*Ad + Cs ==> Cs
+	{ BLEND_CD                 , OP_ADD          , CONST_ZERO      , CONST_ONE}       , // 1111: (Cd - Cd)*Ad + Cd ==> Cd
+	{ BLEND_NO_REC             , OP_ADD          , CONST_ZERO      , CONST_ZERO}      , // 1112: (Cd - Cd)*Ad +  0 ==> 0
+	{ BLEND_NO_REC             , OP_ADD          , CONST_ONE       , CONST_ZERO}      , // 1120: (Cd - Cd)*F  + Cs ==> Cs
+	{ BLEND_CD                 , OP_ADD          , CONST_ZERO      , CONST_ONE}       , // 1121: (Cd - Cd)*F  + Cd ==> Cd
+	{ BLEND_NO_REC             , OP_ADD          , CONST_ZERO      , CONST_ZERO}      , // 1122: (Cd - Cd)*F  +  0 ==> 0
+	{ BLEND_HW4                , OP_ADD          , CONST_ONE       , SRC1_COLOR}      , // 1200: (Cd -  0)*As + Cs ==> Cs + Cd*As
+	{ BLEND_HW1                , OP_ADD          , DST_COLOR       , SRC1_COLOR}      , // 1201: (Cd -  0)*As + Cd ==> Cd*(1 + As)
+	{ BLEND_HW2                , OP_ADD          , DST_COLOR       , SRC1_COLOR}      , // 1202: (Cd -  0)*As +  0 ==> Cd*As
+	{ BLEND_HW6                , OP_ADD          , CONST_ONE       , DST_ALPHA}       , // 1210: (Cd -  0)*Ad + Cs ==> Cs + Cd*Ad
+	{ BLEND_HW1                , OP_ADD          , DST_COLOR       , DST_ALPHA}       , // 1211: (Cd -  0)*Ad + Cd ==> Cd*(1 + Ad)
+	{ BLEND_HW5                , OP_ADD          , CONST_ZERO      , DST_ALPHA}       , // 1212: (Cd -  0)*Ad +  0 ==> Cd*Ad
+	{ BLEND_HW4                , OP_ADD          , CONST_ONE       , CONST_COLOR}     , // 1220: (Cd -  0)*F  + Cs ==> Cs + Cd*F
+	{ BLEND_HW1                , OP_ADD          , DST_COLOR       , CONST_COLOR}     , // 1221: (Cd -  0)*F  + Cd ==> Cd*(1 + F)
+	{ BLEND_HW2                , OP_ADD          , DST_COLOR       , CONST_COLOR}     , // 1222: (Cd -  0)*F  +  0 ==> Cd*F
+	{ BLEND_NO_REC             , OP_ADD          , INV_SRC1_COLOR  , CONST_ZERO}      , // 2000: (0  - Cs)*As + Cs ==> Cs*(1 - As)
+	{ BLEND_ACCU               , OP_REV_SUBTRACT , SRC1_COLOR      , CONST_ONE}       , // 2001: (0  - Cs)*As + Cd ==> Cd - Cs*As
+	{ BLEND_NO_REC             , OP_REV_SUBTRACT , SRC1_COLOR      , CONST_ZERO}      , // 2002: (0  - Cs)*As +  0 ==> 0 - Cs*As
+	{ BLEND_HW9                , OP_ADD          , INV_DST_ALPHA   , CONST_ZERO}      , // 2010: (0  - Cs)*Ad + Cs ==> Cs*(1 - Ad)
+	{ BLEND_HW3                , OP_REV_SUBTRACT , DST_ALPHA       , CONST_ONE}       , // 2011: (0  - Cs)*Ad + Cd ==> Cd - Cs*Ad
+	{ 0                        , OP_REV_SUBTRACT , DST_ALPHA       , CONST_ZERO}      , // 2012: (0  - Cs)*Ad +  0 ==> 0 - Cs*Ad
+	{ BLEND_NO_REC             , OP_ADD          , INV_CONST_COLOR , CONST_ZERO}      , // 2020: (0  - Cs)*F  + Cs ==> Cs*(1 - F)
+	{ BLEND_ACCU               , OP_REV_SUBTRACT , CONST_COLOR     , CONST_ONE}       , // 2021: (0  - Cs)*F  + Cd ==> Cd - Cs*F
+	{ BLEND_NO_REC             , OP_REV_SUBTRACT , CONST_COLOR     , CONST_ZERO}      , // 2022: (0  - Cs)*F  +  0 ==> 0 - Cs*F
+	{ BLEND_HW4                , OP_SUBTRACT     , CONST_ONE       , SRC1_COLOR}      , // 2100: (0  - Cd)*As + Cs ==> Cs - Cd*As
+	{ 0                        , OP_ADD          , CONST_ZERO      , INV_SRC1_COLOR}  , // 2101: (0  - Cd)*As + Cd ==> Cd*(1 - As)
+	{ 0                        , OP_SUBTRACT     , CONST_ZERO      , SRC1_COLOR}      , // 2102: (0  - Cd)*As +  0 ==> 0 - Cd*As
+	{ BLEND_HW6                , OP_SUBTRACT     , CONST_ONE       , DST_ALPHA}       , // 2110: (0  - Cd)*Ad + Cs ==> Cs - Cd*Ad
+	{ BLEND_HW7                , OP_ADD          , CONST_ZERO      , INV_DST_ALPHA}   , // 2111: (0  - Cd)*Ad + Cd ==> Cd*(1 - Ad)
+	{ 0                        , OP_SUBTRACT     , CONST_ZERO      , DST_ALPHA}       , // 2112: (0  - Cd)*Ad +  0 ==> 0 - Cd*Ad
+	{ BLEND_HW4                , OP_SUBTRACT     , CONST_ONE       , CONST_COLOR}     , // 2120: (0  - Cd)*F  + Cs ==> Cs - Cd*F
+	{ 0                        , OP_ADD          , CONST_ZERO      , INV_CONST_COLOR} , // 2121: (0  - Cd)*F  + Cd ==> Cd*(1 - F)
+	{ 0                        , OP_SUBTRACT     , CONST_ZERO      , CONST_COLOR}     , // 2122: (0  - Cd)*F  +  0 ==> 0 - Cd*F
+	{ BLEND_NO_REC             , OP_ADD          , CONST_ONE       , CONST_ZERO}      , // 2200: (0  -  0)*As + Cs ==> Cs
+	{ BLEND_CD                 , OP_ADD          , CONST_ZERO      , CONST_ONE}       , // 2201: (0  -  0)*As + Cd ==> Cd
+	{ BLEND_NO_REC             , OP_ADD          , CONST_ZERO      , CONST_ZERO}      , // 2202: (0  -  0)*As +  0 ==> 0
+	{ BLEND_NO_REC             , OP_ADD          , CONST_ONE       , CONST_ZERO}      , // 2210: (0  -  0)*Ad + Cs ==> Cs
+	{ BLEND_CD                 , OP_ADD          , CONST_ZERO      , CONST_ONE}       , // 2211: (0  -  0)*Ad + Cd ==> Cd
+	{ BLEND_NO_REC             , OP_ADD          , CONST_ZERO      , CONST_ZERO}      , // 2212: (0  -  0)*Ad +  0 ==> 0
+	{ BLEND_NO_REC             , OP_ADD          , CONST_ONE       , CONST_ZERO}      , // 2220: (0  -  0)*F  + Cs ==> Cs
+	{ BLEND_CD                 , OP_ADD          , CONST_ZERO      , CONST_ONE}       , // 2221: (0  -  0)*F  + Cd ==> Cd
+	{ BLEND_NO_REC             , OP_ADD          , CONST_ZERO      , CONST_ZERO}      , // 2222: (0  -  0)*F  +  0 ==> 0
+}};
+
+#ifdef EMUCOREX_ENABLE_NATIVE_SELF_TESTS
+#include "GSPresentUpscaleTests.inl"
+#endif
+
+bool GSDevice::GetFSR1ShaderSource(std::string* source, bool easu_pass)
+{
+	std::optional<std::string> ffx_a_source = ReadShaderSource("shaders/common/ffx_a_fsr1.h");
+	std::optional<std::string> ffx_fsr1_source = ReadShaderSource("shaders/common/ffx_fsr1.h");
+	if (!ffx_a_source.has_value() || !ffx_fsr1_source.has_value())
+		return false;
+
+	// FSR_EASU_F/FSR_RCAS_F gate which function bodies ffx_fsr1.h emits at all, so the pass has
+	// to be chosen before the preprocessor runs. That is why this takes easu_pass rather than
+	// letting the backend pick with a specialization constant the way cas.glsl does.
+	source->insert(0, easu_pass ? "#version 460 core\n#define FSR_PASS_EASU 1\n"
+	                            : "#version 460 core\n#define FSR_PASS_EASU 0\n");
+
+	// Same cheeky string replace as CAS above - our shader compilers don't support includes.
+	StringUtil::ReplaceAll(source, "#include \"ffx_a_fsr1.h\"", ffx_a_source.value());
+	StringUtil::ReplaceAll(source, "#include \"ffx_fsr1.h\"", ffx_fsr1_source.value());
+	return true;
+}
+void GSDevice::FSR1Upscale(GSTexture*& tex, GSVector4i& src_rect, GSVector4& src_uv, const GSVector4& draw_rect)
+{
+	FlushDeferredDraws(GSFlushCause::Present);
+	const int dst_width = static_cast<int>(std::ceil(draw_rect.z - draw_rect.x));
+	const int dst_height = static_cast<int>(std::ceil(draw_rect.w - draw_rect.y));
+	if (dst_width <= 0 || dst_height <= 0)
+		return;
+
+#if !defined(EMUCOREX_DISABLE_GS_DIAGNOSTICS) && !defined(NDEBUG)
+	// Anchored inside FSR1Upscale explicitly: the first attempt at this matched an identical
+	// "GSTexture* src_tex = tex;" line in GSDevice::CAS, which FSR REPLACES, so the log could
+	// never fire and made a working pass look dead.
+	static int s_logged_w = 0, s_logged_h = 0;
+	if (s_logged_w != dst_width || s_logged_h != dst_height)
+	{
+		s_logged_w = dst_width;
+		s_logged_h = dst_height;
+		Console.WriteLnFmt("@@ANDROID_FSR1@@ upscaling {}x{} -> {}x{} (sharpness {})",
+			tex->GetWidth(), tex->GetHeight(), dst_width, dst_height, GSConfig.FSR_Sharpness);
+	}
+#endif
+
+	GSTexture* src_tex = tex;
+
+	// Two targets, not one: RCAS is a separate dispatch that reads EASU's whole output, so it
+	// cannot write in place.
+	if (!m_fsr1_easu || m_fsr1_easu->GetWidth() != dst_width || m_fsr1_easu->GetHeight() != dst_height)
+	{
+		delete m_fsr1_easu;
+		m_fsr1_easu = CreateSurface(GSTexture::ShaderWriteTexture, dst_width, dst_height, 1, GSTexture::Format::Color);
+		if (!m_fsr1_easu)
+		{
+			Console.Error("Failed to allocate FSR1 EASU texture.");
+			return;
+		}
+	}
+	if (!m_fsr1_output || m_fsr1_output->GetWidth() != dst_width || m_fsr1_output->GetHeight() != dst_height)
+	{
+		delete m_fsr1_output;
+		m_fsr1_output = CreateSurface(GSTexture::ShaderWriteTexture, dst_width, dst_height, 1, GSTexture::Format::Color);
+		if (!m_fsr1_output)
+		{
+			Console.Error("Failed to allocate FSR1 RCAS texture.");
+			return;
+		}
+	}
+
+	// Zero-initialised, and pushed whole by both passes: the shader reads the fifth vector
+	// ("Sample") unconditionally to pick AMD's gamma2 output path, which we never want.
+	std::array<u32, NUM_FSR1_CONSTANTS> consts = {};
+
+	// EASU distinguishes the displayed region from the resource holding it: the viewport is the
+	// cropped src_rect, the size is the whole texture, and the offset puts the two together.
+	FsrEasuConOffset(&consts[0], &consts[4], &consts[8], &consts[12],
+		static_cast<AF1>(src_rect.width()), static_cast<AF1>(src_rect.height()),
+		static_cast<AF1>(src_tex->GetWidth()), static_cast<AF1>(src_tex->GetHeight()),
+		static_cast<AF1>(dst_width), static_cast<AF1>(dst_height),
+		static_cast<AF1>(src_rect.x), static_cast<AF1>(src_rect.y));
+
+	if (!DoFSR1EASU(src_tex, m_fsr1_easu, consts))
+	{
+		// leave textures intact if we failed
+		Console.Warning("Applying FSR1 EASU failed.");
+		return;
+	}
+
+	// RCAS takes sharpness in stops - 0 is the maximum and each stop halves it - so the 0..100
+	// slider runs backwards across the 2..0 range AMD's own sample exposes.
+	std::array<u32, NUM_FSR1_CONSTANTS> rcas_consts = {};
+	FsrRcasCon(&rcas_consts[0], 2.0f - (static_cast<float>(GSConfig.FSR_Sharpness) * 0.02f));
+
+	if (!DoFSR1RCAS(m_fsr1_easu, m_fsr1_output, rcas_consts))
+	{
+		Console.Warning("Applying FSR1 RCAS failed.");
+		return;
+	}
+
+	tex = m_fsr1_output;
+	src_rect = GSVector4i(0, 0, dst_width, dst_height);
+	src_uv = GSVector4(0.0f, 0.0f, 1.0f, 1.0f);
+}
+void GSDevice::SGSRUpscale(GSTexture*& tex, GSVector4i& src_rect, GSVector4& src_uv, const GSVector4& draw_rect,
+	bool edge_direction)
+{
+	FlushDeferredDraws(GSFlushCause::Present);
+	const int dst_width = static_cast<int>(std::ceil(draw_rect.z - draw_rect.x));
+	const int dst_height = static_cast<int>(std::ceil(draw_rect.w - draw_rect.y));
+	if (dst_width <= 0 || dst_height <= 0)
+		return;
+
+	GSTexture* src_tex = tex;
+
+#if !defined(EMUCOREX_DISABLE_GS_DIAGNOSTICS) && !defined(NDEBUG)
+	static int s_logged_w = 0, s_logged_h = 0;
+	if (s_logged_w != dst_width || s_logged_h != dst_height)
+	{
+		s_logged_w = dst_width;
+		s_logged_h = dst_height;
+		Console.WriteLnFmt("@@ANDROID_SGSR@@ upscaling {}x{} -> {}x{} (sharpness {}{})",
+			src_rect.width(), src_rect.height(), dst_width, dst_height, GSConfig.SGSR_Sharpness,
+			edge_direction ? ", edge-direction" : "");
+	}
+#endif
+
+	// One target, unlike FSR1: SGSR is a single pass, so there is no intermediate to hand on.
+	if (!m_sgsr_output || m_sgsr_output->GetWidth() != dst_width || m_sgsr_output->GetHeight() != dst_height)
+	{
+		delete m_sgsr_output;
+		m_sgsr_output = CreateSurface(GSTexture::ShaderWriteTexture, dst_width, dst_height, 1, GSTexture::Format::Color);
+		if (!m_sgsr_output)
+		{
+			Console.Error("Failed to allocate SGSR output texture.");
+			return;
+		}
+	}
+
+	// The picture occupies src_rect inside a larger merge target, so the shader is told where it
+	// is rather than assuming the whole texture — the same problem FsrEasuConOffset solves for
+	// FSR1 by taking an offset.
+	const float src_tex_w = static_cast<float>(src_tex->GetWidth());
+	const float src_tex_h = static_cast<float>(src_tex->GetHeight());
+	const float uv_off_x = static_cast<float>(src_rect.x) / src_tex_w;
+	const float uv_off_y = static_cast<float>(src_rect.y) / src_tex_h;
+	const float uv_scale_x = static_cast<float>(src_rect.width()) / src_tex_w;
+	const float uv_scale_y = static_cast<float>(src_rect.height()) / src_tex_h;
+
+	// Its OWN setting, 0..200, where 100 is Qualcomm's default of 1.0. Sharing FSR's would mean
+	// an existing FSR configuration quietly means something different under SGSR, and widening
+	// FSR's to reach 2.0 would change what every FSR value already in the wild means. Neither is
+	// worth saving one setting. See Pcsx2Config::GSOptions::SGSR_Sharpness.
+	const float sharpness = std::clamp(static_cast<float>(GSConfig.SGSR_Sharpness) * 0.01f, 0.0f, 2.0f);
+
+	std::array<u32, NUM_SGSR_CONSTANTS> consts = {};
+	const auto put_f = [&consts](u32 i, float v) { std::memcpy(&consts[i], &v, sizeof(float)); };
+	consts[0] = static_cast<u32>(dst_width);
+	consts[1] = static_cast<u32>(dst_height);
+	put_f(2, uv_off_x);
+	put_f(3, uv_off_y);
+	put_f(4, uv_scale_x);
+	put_f(5, uv_scale_y);
+	put_f(6, src_tex_w);
+	put_f(7, src_tex_h);
+	put_f(8, 1.0f / src_tex_w);
+	put_f(9, 1.0f / src_tex_h);
+	put_f(10, sharpness);
+
+	if (!DoSGSR(src_tex, m_sgsr_output, consts, edge_direction))
+	{
+		// leave textures intact if we failed
+		Console.Warning("Applying SGSR failed.");
+		return;
+	}
+
+	tex = m_sgsr_output;
+	src_rect = GSVector4i(0, 0, dst_width, dst_height);
+	src_uv = GSVector4(0.0f, 0.0f, 1.0f, 1.0f);
+}
